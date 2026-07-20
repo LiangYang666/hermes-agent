@@ -1582,3 +1582,37 @@ def test_repair_cursor_invalidates_scan_prefix_when_stamped_dict_dirtied():
     assert repairs == 1
     assert _DB_PERSISTED_MARKER not in messages[0]
     assert agent._db_flush_scan_prefix is None
+
+
+def test_dedupe_drops_tool_calls_key_when_all_removed():
+    """When every tool_call in an assistant turn is a duplicate of an
+    OUTSTANDING (unanswered) earlier call, ``_dedupe_tool_call_ids`` must
+    drop the ``tool_calls`` key entirely instead of leaving
+    ``tool_calls: []``. Strict OpenAI-compatible providers such as Alibaba
+    Qwen reject an empty array with: "Empty tool_calls is not supported in
+    message."
+
+    Unit-level on the dedup pass itself: through the full
+    ``sanitize_api_messages`` pipeline an unanswered call is stub-resolved
+    first, so the replay legitimately re-arms the id and is kept (positional
+    prune semantics, #93251 era). The drop-key branch only guards payloads
+    where the replay still collides with an outstanding id — exercise it
+    directly here.
+    """
+    from agent.agent_runtime_helpers import _dedupe_tool_call_ids
+
+    tc = lambda i: {"id": i, "type": "function",
+                    "function": {"name": "foo", "arguments": "{}"}}
+    messages = [
+        {"role": "user", "content": "first"},
+        # Unanswered call_1 stays outstanding...
+        {"role": "assistant", "content": None, "tool_calls": [tc("call_1")]},
+        # ...so this replay collides and every call is removed; the key must
+        # be dropped rather than left as an empty array.
+        {"role": "assistant", "content": "retry", "tool_calls": [tc("call_1")]},
+    ]
+    out = _dedupe_tool_call_ids(list(messages))
+    assistants = [m for m in out if m.get("role") == "assistant"]
+    assert [tc_["id"] for tc_ in assistants[0]["tool_calls"]] == ["call_1"]
+    assert "tool_calls" not in assistants[1]
+    assert assistants[1]["content"] == "retry"
