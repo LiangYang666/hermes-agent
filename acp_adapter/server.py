@@ -20,8 +20,9 @@ from acp.schema import (
     Implementation, InitializeResponse, ListSessionsResponse, LoadSessionResponse, McpServerHttp, McpServerSse,
     McpServerStdio, ModelInfo, NewSessionResponse, PromptCapabilities, PromptResponse, ResumeSessionResponse,
     SessionCapabilities, SessionForkCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
-    SessionMode, SessionModeState, SessionModelState, SessionResumeCapabilities, SetSessionConfigOptionResponse,
-    SetSessionModeResponse, SetSessionModelResponse, TextContentBlock, Usage, UsageUpdate, UserMessageChunk,
+    SessionConfigOptionSelect, SessionConfigSelectOption, SessionMode, SessionModeState, SessionModelState,
+    SessionResumeCapabilities, SetSessionConfigOptionResponse, SetSessionModeResponse, SetSessionModelResponse,
+    TextContentBlock, Usage, UsageUpdate, UserMessageChunk,
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
@@ -235,6 +236,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
+    _REASONING_EFFORT_CONFIG_ID = "reasoning_effort"
+    # ACP display labels for ladder levels (the CLI /reasoning picker's equivalents).
+    _EFFORT_LABELS = {"none": "Off", "minimal": "Minimal", "low": "Low", "medium": "Medium",
+                      "high": "High", "xhigh": "Extra high", "max": "Max", "ultra": "Ultra"}
     _MODE_DEFAULT = "default"
     # mode id -> (edit approval policy, display name, description)
     _MODES: dict[str, tuple[str, str, str]] = {
@@ -294,6 +299,40 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
+
+    def _build_config_options(self, state: SessionState) -> "list[Any]":
+        """Typed ACP config surface: the session's thinking depth as a select.
+
+        Options are exactly ``route_supported_efforts(provider, model)`` — advertising a level
+        the wire would 400 (e.g. ``ultra``) is worse than not offering it. ``currentValue`` is
+        the session pick when set; genuinely-unset stays "" (never invent an effort). The edit
+        approval policy is deliberately NOT duplicated here — ACP clients render it via
+        ``modes`` (see ``_session_modes``), which is its canonical surface."""
+        from agent.reasoning_effort import route_supported_efforts
+
+        provider = str(getattr(state.agent, "provider", "") or "") or None
+        model = str(getattr(state.agent, "model", "") or state.model or "") or None
+        supported = route_supported_efforts(provider, model)
+        current = ""
+        rc = getattr(state, "reasoning_config", None)
+        if isinstance(rc, dict):
+            if rc.get("enabled") is False:
+                current = "none" if "none" in supported else ""
+            else:
+                raw = str(rc.get("effort") or "").strip().lower()
+                # An out-of-route stored value maps to "" (follow the wire default) rather
+                # than selecting a choice the picker never advertised.
+                current = raw if raw in supported else ""
+        return [SessionConfigOptionSelect(
+            id=self._REASONING_EFFORT_CONFIG_ID,
+            name="Thinking depth",
+            description="How much the model reasons before answering (session-scoped).",
+            type="select",
+            current_value=current,
+            options=[SessionConfigSelectOption(value=lv,
+                                               name=self._EFFORT_LABELS.get(lv, lv.capitalize()))
+                     for lv in supported],
+        )]
 
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
         """Authenticated providers + models, from the shared Hermes inventory (same substrate
@@ -598,6 +637,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return {
             "models": self._build_model_state(state),
             "modes": self._session_modes(state),
+            "config_options": self._build_config_options(state),
             "field_meta": self._provenance_meta(state.session_id, getattr(state.agent, "session_id", state.session_id)),
         }
 
@@ -1067,7 +1107,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     async def set_config_option(
         self, config_id: str, session_id: str, value: str, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
-        """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
+        """Apply a typed ACP config option to a live session and return the rebuilt option list."""
         state = await asyncio.to_thread(self.session_manager.get_session, session_id)
         if state is None:
             logger.warning("Session %s: config update requested for missing session", session_id)
@@ -1075,6 +1115,30 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
             state.mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
+        elif str(config_id) == self._REASONING_EFFORT_CONFIG_ID:
+            from agent.reasoning_effort import route_supported_efforts
+            from hermes_constants import parse_reasoning_effort
+
+            provider = str(getattr(state.agent, "provider", "") or "") or None
+            model = str(getattr(state.agent, "model", "") or state.model or "") or None
+            supported = route_supported_efforts(provider, model)
+            parsed = parse_reasoning_effort(value)
+            if parsed is None or (parsed.get("enabled") is not False
+                                  and str(parsed.get("effort") or "") not in supported):
+                # Unknown word or off-route level: reject as a bad param (-32602) instead of
+                # silently snapping to some other tier — the client's picker is showing exactly
+                # `supported`, so arriving with anything else is a protocol error, not a choice.
+                from acp.exceptions import RequestError
+                raise RequestError.invalid_params(
+                    {"details": f"unknown reasoning_effort {value!r}; supported: {', '.join(supported)}"})
+            state.reasoning_config = parsed
+            # Push onto the LIVE agent immediately (same direct assignment as the TUI's
+            # /reasoning): the next turn builds its request from agent.reasoning_config.
+            try:
+                state.agent.reasoning_config = parsed
+            except Exception:
+                logger.debug("Session %s: failed to push reasoning_config onto agent",
+                             session_id, exc_info=True)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
@@ -1083,7 +1147,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             state.config_options = options
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
-        return SetSessionConfigOptionResponse(config_options=[])
+        return SetSessionConfigOptionResponse(config_options=self._build_config_options(state))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

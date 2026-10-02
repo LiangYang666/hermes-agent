@@ -136,6 +136,15 @@ class SessionState:
     agent: Any  # AIAgent instance
     cwd: str = "."
     model: str = ""
+    # ACP permission mode (default / accept_edits / dont_ask). Persisted in the
+    # session's model_config JSON so a process restart or session/load keeps the
+    # user's approval setting instead of silently falling back to the default.
+    mode: str = ""
+    # Reasoning effort chosen via ACP session/config_options (id=reasoning_effort).
+    # Persisted in model_config so a process restart / session/load does not silently
+    # revert thinking depth to the config default while the cockpit still shows the
+    # picked level. (The parallel permission-mode feature persists ``mode`` the same way.)
+    reasoning_config: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -201,9 +210,20 @@ class SessionManager:
         if original is None:
             return None
         new_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None)
+        # A fork is a continuation, not a fresh session: carry the parent's session-scoped
+        # reasoning effort into the child's agent AND its state (same idea as the parallel
+        # mode-inheritance feature). ``None`` parent picks -> child follows the config default.
+        parent_reasoning = getattr(original, "reasoning_config", None)
+        if not isinstance(parent_reasoning, dict):
+            live = getattr(original.agent, "reasoning_config", None)
+            parent_reasoning = live if isinstance(live, dict) else None
+        agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None,
+                                 reasoning_config=parent_reasoning)
         model = getattr(agent, "model", original.model) or original.model
-        state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history))
+        state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history),
+                                    mode=getattr(original, "mode", "") or "")
+        if isinstance(parent_reasoning, dict):
+            state.reasoning_config = parent_reasoning
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
@@ -276,10 +296,11 @@ class SessionManager:
     # ---- persistence via SessionDB ------------------------------------------
 
     def _install_state(self, session_id: str, agent: Any, cwd: str, model: str,
-                       history: List[Dict[str, Any]], *, persist: bool = True) -> SessionState:
+                       history: List[Dict[str, Any]], *, persist: bool = True,
+                       mode: str = "") -> SessionState:
         """Build a SessionState, register it in memory, bind its cwd for tools, optionally persist."""
         state = SessionState(session_id=session_id, agent=agent, cwd=cwd, model=model,
-                             history=history, cancel_event=threading.Event())
+                             mode=mode, history=history, cancel_event=threading.Event())
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
@@ -319,11 +340,22 @@ class SessionManager:
 
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
-        session_meta = {"cwd": state.cwd}
+        session_meta: dict[str, Any] = {"cwd": state.cwd}
         for key in ("provider", "base_url", "api_mode"):
             value = getattr(state.agent, key, None)
             if isinstance(value, str) and value.strip():
                 session_meta[key] = value.strip()
+        # Persist the ACP permission mode so session/load after a restart keeps the
+        # user's approval setting. set_session_mode/set_config_option write
+        # state.mode then call save_session() — without this field the mode
+        # silently reverts to the default on restore.
+        if isinstance(getattr(state, "mode", None), str) and state.mode.strip():
+            session_meta["mode"] = state.mode.strip()
+        # Session-scoped reasoning effort picked over ACP (config_options) must ride in
+        # the metadata blob, or a restart silently reverts thinking depth to the config
+        # default while the client UI keeps showing the user's selection.
+        if isinstance(getattr(state, "reasoning_config", None), dict):
+            session_meta["reasoning_config"] = state.reasoning_config
 
         try:
             if db.get_session(state.session_id) is None:
@@ -430,6 +462,12 @@ class SessionManager:
 
         meta = _parse_model_config(row.get("model_config"))
         cwd, model = meta.get("cwd", "."), row.get("model") or None
+        restored_mode = str(meta.get("mode") or "")
+        # Session-scoped reasoning effort picked over ACP rides in the metadata blob; legacy
+        # rows simply have no key -> None -> _make_agent follows the config default.
+        restored_reasoning = meta.get("reasoning_config")
+        if not isinstance(restored_reasoning, dict):
+            restored_reasoning = None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
@@ -443,12 +481,15 @@ class SessionManager:
             agent = self._make_agent(
                 session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
                 requested_provider=meta.get("provider") or row.get("billing_provider"),
-                base_url=meta.get("base_url") or row.get("billing_base_url"))
+                base_url=meta.get("base_url") or row.get("billing_base_url"),
+                reasoning_config=restored_reasoning)
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
         state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
-                                    history, persist=False)
+                                    history, persist=False, mode=restored_mode)
+        if restored_reasoning is not None:
+            state.reasoning_config = restored_reasoning
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
@@ -456,9 +497,11 @@ class SessionManager:
 
     def _make_agent(self, *, session_id: str, cwd: str, model: str | None = None,
                     requested_provider: str | None = None, base_url: str | None = None, api_mode: str | None = None,
-                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None):
+                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None,
+                    reasoning_config: dict | None = None):
         """``enabled_toolsets``/``disabled_toolsets`` carry a live session's toolsets into a rebuild; ``None`` derives
-        them from config (fresh session)."""
+        them from config (fresh session). ``reasoning_config`` carries a session-scoped effort picked over ACP
+        (``session/set_config_option``) into a rebuild; ``None`` follows the config default."""
         if self._agent_factory is not None:
             return self._agent_factory()
 
@@ -494,8 +537,11 @@ class SessionManager:
             "cwd": cwd,
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never
             # reaches an ACP session and the transport applies its default effort (a 400 on non-reasoning
-            # models). Resolved against the session's model so per-model overrides apply.
-            "reasoning_config": resolve_reasoning_config(config, model or default_model),
+            # models). Resolved against the session's model so per-model overrides apply. A session-scoped
+            # pick over ACP (``reasoning_config`` param, persisted in model_config) wins over the config
+            # default — the same precedence the TUI gives ``create_reasoning_override``.
+            "reasoning_config": (reasoning_config if isinstance(reasoning_config, dict)
+                                 else resolve_reasoning_config(config, model or default_model)),
         }
         resolve_error: Exception | None = None
         try:
