@@ -208,7 +208,7 @@ class TestFreeFormBudget:
         assert meta["freeform"] is True, "without this a client has no reason to offer an input"
         assert meta["unit"] == "tokens"
         assert meta["min"] == HermesACPAgent._CONTEXT_BUDGET_MIN_TOKENS
-        assert meta["presets"] == [65536, 131072, 200000, 400000, 1000000], \
+        assert meta["presets"] == [262144, 524288, 786432, 1048576], \
             "presets must stay available as shortcuts next to the input"
 
     def test_a_hand_typed_window_is_accepted_and_echoed_as_an_option(self):
@@ -238,7 +238,7 @@ class TestFreeFormBudget:
         state = _live_session(manager)
 
         asyncio.run(acp_agent.set_config_option(
-            config_id="context_budget", session_id=state.session_id, value="131072"))
+            config_id="context_budget", session_id=state.session_id, value="262144"))
 
         opt = _budget_option(acp_agent, state)
         assert [o.value for o in opt.options] == [v for v, _ in HermesACPAgent._CONTEXT_BUDGET_CHOICES]
