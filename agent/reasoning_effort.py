@@ -79,6 +79,70 @@ GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: Qwen 3.8 family on DashScope (千问/百炼 docs, checked 2026-10-06): thinking is ON by default and
+#: ``reasoning_effort`` takes exactly ``low``/``medium``/``xhigh`` — ``high`` and ``max`` are
+#: documented aliases of ``xhigh``, and ``minimal`` maps onto ``low``. Thinking is switched off
+#: with ``extra_body.enable_thinking=false``, so ``none`` IS a level on this route (it is the
+#: toggle), which is why the advertised ladder carries it. Never set ``thinking_budget`` alongside:
+#: the docs reject the combination outright.
+QWEN38_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "xhigh")
+QWEN38_OVERRIDES: dict[str, str] = {"minimal": "low", "high": "xhigh", "max": "xhigh"}
+
+#: Levels a wire takes when it also owns the thinking toggle (DeepSeek V4, Qwen 3.8 on DashScope):
+#: ``none`` is not an effort, it is ``thinking: disabled`` — but a picker has to offer it as one
+#: level or the operator cannot turn thinking off at all.
+DEEPSEEK_ROUTE_EFFORTS: tuple[str, ...] = ("none",) + DEEPSEEK_V4_EFFORTS
+
+#: Provider profile names (and their documented aliases) → the levels their wire really accepts.
+#: Anything absent keeps the widest OpenAI-compatible vocabulary above: a route we have not
+#: verified must not have choices taken away from it, and it clamps again downstream anyway.
+_ROUTE_EFFORTS: dict[str, tuple[str, ...]] = {
+    "deepseek": DEEPSEEK_ROUTE_EFFORTS,
+    "deep-seek": DEEPSEEK_ROUTE_EFFORTS,
+    "deepseek-chat": DEEPSEEK_ROUTE_EFFORTS,
+    "alibaba": QWEN38_EFFORTS,
+    "alibaba-cn": QWEN38_EFFORTS,
+    "alibaba-cloud": QWEN38_EFFORTS,
+    "alibaba-cloud-cn": QWEN38_EFFORTS,
+    "alibaba-token-plan": QWEN38_EFFORTS,
+    "alibaba-token-plan-cn": QWEN38_EFFORTS,
+    "dashscope": QWEN38_EFFORTS,
+    "dashscope-cn": QWEN38_EFFORTS,
+    "qwen-dashscope": QWEN38_EFFORTS,
+    "aliyun": QWEN38_EFFORTS,
+}
+
+#: Model ids whose OWN wire is narrower than their host's, so the ladder follows the model rather
+#: than the host (a DashScope endpoint serves Qwen, DeepSeek and GLM with different ladders).
+_MODEL_ROUTE_EFFORTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("deepseek-v4", DEEPSEEK_ROUTE_EFFORTS),
+    ("qwen3", QWEN38_EFFORTS),
+    ("qwen-3", QWEN38_EFFORTS),
+)
+
+
+def route_offered_efforts(provider: Optional[str], model: Optional[str]) -> tuple[str, ...]:
+    """The effort levels to OFFER for one (provider, model) route — what a picker should show.
+
+    Distinct from :func:`route_supported_efforts`, which is the ENTRY clamp and stays deliberately
+    wide (the CLI/TUI already accept ``xhigh`` on routes that map it with their own overrides; a
+    narrower entry clamp would reject choices those surfaces have always taken). This one is for
+    advertising: a cockpit renders exactly these, so a level we offer but the wire folds away is
+    the bug the operator reports as "the setting does nothing".
+
+    Model first: the same DashScope host serves Qwen (``low``/``medium``/``xhigh``), DeepSeek
+    (``low``..``max``) and GLM (thinking-only, no off switch), so the model id — not the host —
+    decides the ladder. Then the provider profile name (plus its aliases), then the widest
+    vocabulary, so an unverified route never loses choices.
+    """
+    m = (model or "").strip().lower()
+    if m:
+        for prefix, levels in _MODEL_ROUTE_EFFORTS:
+            if m.startswith(prefix):
+                return levels
+    p = (provider or "").strip().lower()
+    return _ROUTE_EFFORTS.get(p, OPENAI_COMPAT_WIRE_EFFORTS)
+
 #: Ollama Cloud /v1/chat/completions: rejects ``minimal`` with HTTP 400.
 OLLAMA_CLOUD_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
 OLLAMA_CLOUD_OVERRIDES: dict[str, str] = {"xhigh": "max"}

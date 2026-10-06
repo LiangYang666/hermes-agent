@@ -48,8 +48,9 @@ async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(ag
     resp = await agent.new_session(cwd="/tmp")
 
     # Edit approval is a MODE, never a config option. Config options exist now, but only
-    # for the typed surface (thinking depth) — see test_acp_reasoning_effort_config.py.
-    assert [o.id for o in (resp.config_options or [])] == ["reasoning_effort"]
+    # for the typed surface (thinking depth, context budget) — see
+    # test_acp_reasoning_effort_config.py / test_acp_context_budget_config.py.
+    assert [o.id for o in (resp.config_options or [])] == ["reasoning_effort", "context_budget"]
     assert isinstance(resp.modes, SessionModeState)
     assert resp.modes.current_mode_id == "default"
     assert [mode.id for mode in resp.modes.available_modes] == [
@@ -71,8 +72,8 @@ async def test_set_config_option_persists_edit_approval_policy_without_advertisi
 
     assert isinstance(update, SetSessionConfigOptionResponse)
     # Approval policy must NOT appear as a config option (it is a mode); the rebuilt typed
-    # surface carries only reasoning_effort.
-    assert [o.id for o in update.config_options] == ["reasoning_effort"]
+    # surface carries only reasoning_effort and context_budget.
+    assert [o.id for o in update.config_options] == ["reasoning_effort", "context_budget"]
     assert getattr(state, "mode", None) == "accept_edits"
 
 
@@ -351,7 +352,7 @@ class TestSessionConfiguration:
         assert mode_result == {}
         # Unknown free-form config ids still pass through (no typed option added for them).
         # The router returns the serialized wire form, so options are camelCase dicts.
-        assert [o["id"] for o in config_result["configOptions"]] == ["reasoning_effort"]
+        assert [o["id"] for o in config_result["configOptions"]] == ["reasoning_effort", "context_budget"]
 
 
 

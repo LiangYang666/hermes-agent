@@ -237,6 +237,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
     _REASONING_EFFORT_CONFIG_ID = "reasoning_effort"
+    _CONTEXT_BUDGET_CONFIG_ID = "context_budget"
+    # Offered context windows, in tokens. The VALUE is the number Hermes budgets against: the
+    # compressor compresses at a percentage of it, so this is a real early-compaction knob, not a
+    # display override. "auto" follows the model's own window (what an unset session means), which
+    # keeps every pick reversible.
+    _CONTEXT_BUDGET_CHOICES: tuple[tuple[str, str], ...] = (
+        ("auto", "Auto (model window)"),
+        ("65536", "64K"),
+        ("131072", "128K"),
+        ("200000", "200K"),
+        ("400000", "400K"),
+        ("1000000", "1M"),
+    )
     # ACP display labels for ladder levels (the CLI /reasoning picker's equivalents).
     _EFFORT_LABELS = {"none": "Off", "minimal": "Minimal", "low": "Low", "medium": "Medium",
                       "high": "High", "xhigh": "Extra high", "max": "Max", "ultra": "Ultra"}
@@ -300,19 +313,47 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
 
-    def _build_config_options(self, state: SessionState) -> "list[Any]":
-        """Typed ACP config surface: the session's thinking depth as a select.
+    @staticmethod
+    def _parse_context_budget(value: Any) -> "int | None":
+        """``auto``/empty → None (follow the model's own window); ``200000``/``64k`` → that many
+        tokens. Rejects anything else rather than guessing a ceiling the operator did not ask for.
+        """
+        raw = str(value or "").strip().lower().replace("_", "").replace(" ", "")
+        if raw in {"", "auto", "none", "model", "default", "null"}:
+            return None
+        mult = 1
+        if raw.endswith("k"):
+            mult, raw = 1000, raw[:-1]
+        elif raw.endswith("m"):
+            mult, raw = 1_000_000, raw[:-1]
+        try:
+            tokens = int(float(raw) * mult)
+        except (TypeError, ValueError):
+            tokens = 0
+        if tokens <= 0:
+            from acp.exceptions import RequestError
 
-        Options are exactly ``route_supported_efforts(provider, model)`` — advertising a level
-        the wire would 400 (e.g. ``ultra``) is worse than not offering it. ``currentValue`` is
-        the session pick when set; genuinely-unset stays "" (never invent an effort). The edit
-        approval policy is deliberately NOT duplicated here — ACP clients render it via
-        ``modes`` (see ``_session_modes``), which is its canonical surface."""
-        from agent.reasoning_effort import route_supported_efforts
+            raise RequestError.invalid_params(
+                {"details": f"unknown context budget {value!r}; use \"auto\" or a positive token count"})
+        return tokens
+
+    def _build_config_options(self, state: SessionState) -> "list[Any]":
+        """Typed ACP config surface: the session's thinking depth and context budget, as selects.
+
+        Options are exactly ``route_offered_efforts(provider, model)`` — the levels this route's
+        wire really takes. Advertising a wider vocabulary is what makes a cockpit's picker lie:
+        Qwen 3.8 takes ``low``/``medium``/``xhigh`` (its docs alias ``high``/``max`` onto
+        ``xhigh``) and DeepSeek V4 takes ``low``..``max``, so a picker showing seven levels has
+        four of them folded away on the wire and reads as "the setting does nothing" (operator
+        report, 2026-10-06). ``currentValue`` is the session pick when set; genuinely-unset stays
+        "" (never invent an effort). The edit approval policy is deliberately NOT duplicated here
+        — ACP clients render it via ``modes`` (see ``_session_modes``), which is its canonical
+        surface."""
+        from agent.reasoning_effort import route_offered_efforts
 
         provider = str(getattr(state.agent, "provider", "") or "") or None
         model = str(getattr(state.agent, "model", "") or state.model or "") or None
-        supported = route_supported_efforts(provider, model)
+        supported = route_offered_efforts(provider, model)
         current = ""
         rc = getattr(state, "reasoning_config", None)
         if isinstance(rc, dict):
@@ -332,6 +373,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             options=[SessionConfigSelectOption(value=lv,
                                                name=self._EFFORT_LABELS.get(lv, lv.capitalize()))
                      for lv in supported],
+        ), SessionConfigOptionSelect(
+            id=self._CONTEXT_BUDGET_CONFIG_ID,
+            name="Context budget",
+            description="The window Hermes budgets and compresses against (session-scoped).",
+            type="select",
+            current_value=(str(budget) if (budget := getattr(state, "context_budget", None))
+                           else "auto"),
+            options=[SessionConfigSelectOption(value=v, name=n) for v, n in self._CONTEXT_BUDGET_CHOICES],
         )]
 
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
@@ -1126,8 +1175,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if parsed is None or (parsed.get("enabled") is not False
                                   and str(parsed.get("effort") or "") not in supported):
                 # Unknown word or off-route level: reject as a bad param (-32602) instead of
-                # silently snapping to some other tier — the client's picker is showing exactly
-                # `supported`, so arriving with anything else is a protocol error, not a choice.
+                # silently snapping to some other tier. Validation is the ENTRY clamp (wide on
+                # purpose: the CLI/TUI have always sent ``xhigh`` to routes that map it); the
+                # picker offers the narrower ``route_offered_efforts`` set, so a value arriving
+                # from it never lands here, and an off-ladder one is mapped by the profile.
                 from acp.exceptions import RequestError
                 raise RequestError.invalid_params(
                     {"details": f"unknown reasoning_effort {value!r}; supported: {', '.join(supported)}"})
@@ -1139,6 +1190,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             except Exception:
                 logger.debug("Session %s: failed to push reasoning_config onto agent",
                              session_id, exc_info=True)
+        elif str(config_id) == self._CONTEXT_BUDGET_CONFIG_ID:
+            tokens = self._parse_context_budget(value)
+            state.context_budget = tokens
+            from acp_adapter.session import apply_context_budget
+
+            if not apply_context_budget(state.agent, tokens):
+                # A test double without a compressor: the pick is still recorded (and advertised
+                # back), it just has nothing to steer in this process.
+                logger.debug("Session %s: no context compressor to pin a budget on", session_id)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):

@@ -145,6 +145,12 @@ class SessionState:
     # revert thinking depth to the config default while the cockpit still shows the
     # picked level. (The parallel permission-mode feature persists ``mode`` the same way.)
     reasoning_config: Optional[Dict[str, Any]] = None
+    # Context budget picked over ACP (config option ``context_budget``): the window Hermes budgets
+    # its compression against, in tokens. None follows the model/config default. Persisted like
+    # ``reasoning_config`` so a restart or session/load keeps the ceiling the operator chose —
+    # without it a cockpit keeps showing the pick while the session silently compresses against
+    # the model's full window again.
+    context_budget: Optional[int] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -160,6 +166,36 @@ class SessionState:
     # Per-session allocator for ACP assistant messageIds (lazily created by
     # the server so streamed chunks group into distinct assistant replies).
     message_ids: Any = None
+
+
+def apply_context_budget(agent, tokens: Optional[int]) -> bool:
+    """Pin (or clear) the context window Hermes budgets and compresses against.
+
+    ``context_budget`` is a real knob, not a display number: the compressor derives its trigger as a
+    percentage of this window, so picking 64K on a 200K model makes the session compress early
+    instead of at the model's own ceiling. Reuses the same pair the TUI/gateway config path uses
+    (#116467): ``set_config_context_length`` refreshes BOTH cached copies of the pin (agent +
+    compressor), then the compressor re-derives percent and threshold from the new window, so it can
+    never report one ceiling while compressing against another. ``None`` drops the override and lets
+    construction's deferred resolution infer the model's own window again (re-applying the
+    small-context floor). Returns False when the agent has no compressor to steer — a test double, in
+    which case the caller has still recorded the pick.
+    """
+    from agent.agent_init import set_config_context_length
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return False
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0:
+        set_config_context_length(agent, tokens)
+        compressor.context_length = tokens
+    else:
+        set_config_context_length(agent, None)
+        # Force re-inference from model metadata on next access (mirrors the config-save path).
+        compressor._resolved_context_length = None
+    # Invalidate the cached trigger so the next preflight re-derives from the new window.
+    compressor._threshold_tokens = compressor._tail_token_budget = None
+    return True
 
 
 class SessionManager:
@@ -356,6 +392,10 @@ class SessionManager:
         # default while the client UI keeps showing the user's selection.
         if isinstance(getattr(state, "reasoning_config", None), dict):
             session_meta["reasoning_config"] = state.reasoning_config
+        # Same reason for the context budget: a picked window that is not persisted reverts to the
+        # model default on the next restore while the cockpit still shows the pick.
+        if isinstance(getattr(state, "context_budget", None), int) and (state.context_budget or 0) > 0:
+            session_meta["context_budget"] = state.context_budget
 
         try:
             if db.get_session(state.session_id) is None:
@@ -468,6 +508,10 @@ class SessionManager:
         restored_reasoning = meta.get("reasoning_config")
         if not isinstance(restored_reasoning, dict):
             restored_reasoning = None
+        # Context budget picked over ACP (legacy rows simply have no key -> None -> model default).
+        restored_budget = meta.get("context_budget")
+        if not isinstance(restored_budget, int) or isinstance(restored_budget, bool) or restored_budget <= 0:
+            restored_budget = None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
@@ -490,6 +534,9 @@ class SessionManager:
                                     history, persist=False, mode=restored_mode)
         if restored_reasoning is not None:
             state.reasoning_config = restored_reasoning
+        if restored_budget is not None:
+            state.context_budget = restored_budget
+            apply_context_budget(agent, restored_budget)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
