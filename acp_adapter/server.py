@@ -35,7 +35,13 @@ from acp_adapter.events import (
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionManager,
+    SessionState,
+    _expand_acp_enabled_toolsets,
+    model_window_pin,
+    write_model_window_pin,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.interrupt_compat import request_hard_interrupt
@@ -382,7 +388,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 # An out-of-route stored value maps to "" (follow the wire default) rather
                 # than selecting a choice the picker never advertised.
                 current = raw if raw in supported else ""
-        budget = getattr(state, "context_budget", None)
+        # The budget is a property of the MODEL, not the session: the pin in config.yaml
+        # (model_overrides.<provider>.<model>.context_window, resolution step 0b) is what every
+        # Hermes runtime reads, so it wins over the session mirror. A session that never picked one
+        # still shows the window its model is pinned to — the same number the CLI/toolbox would.
+        budget = model_window_pin(provider or "", model or "") or getattr(state, "context_budget", None)
         current_budget = str(budget) if budget else "auto"
         budget_options = [SessionConfigSelectOption(value=v, name=n)
                           for v, n in self._CONTEXT_BUDGET_CHOICES]
@@ -404,7 +414,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         ), SessionConfigOptionSelect(
             id=self._CONTEXT_BUDGET_CONFIG_ID,
             name="Context budget",
-            description="The window Hermes budgets and compresses against (session-scoped).",
+            description="The window Hermes budgets and compresses against — saved for this MODEL, "
+                        "so every session on it uses the same ceiling.",
             type="select",
             current_value=current_budget,
             options=budget_options,
@@ -419,8 +430,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 "min": self._CONTEXT_BUDGET_MIN_TOKENS,
                 "step": 1024,
                 "presets": [int(v) for v, _ in self._CONTEXT_BUDGET_CHOICES if v != "auto"],
-                "note": "Any positive token count. Narrows the window Hermes compresses at; "
-                        "it cannot raise it above the model's own.",
+                "scope": "model",
+                "note": "Any positive token count. Saved for this model (config.yaml "
+                        "model_overrides), so the next session on it starts from the same ceiling. "
+                        "It narrows the window Hermes compresses at; it cannot raise it above the "
+                        "model's own.",
             },
         )]
 
@@ -1240,6 +1254,21 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 # A test double without a compressor: the pick is still recorded (and advertised
                 # back), it just has nothing to steer in this process.
                 logger.debug("Session %s: no context compressor to pin a budget on", session_id)
+            # Global, not session-scoped: the window belongs to the MODEL (config.yaml
+            # model_overrides, the same pin the TUI/gateway/a fresh CLI run reads). Written first so
+            # the answer we return already describes what the next session will get.
+            provider = str(getattr(state.agent, "provider", "") or "")
+            model = str(getattr(state.agent, "model", "") or state.model or "")
+            if not write_model_window_pin(provider, model, tokens):
+                logger.info("Session %s: context window for %s/%s stays session-scoped",
+                            session_id, provider or "?", model or "?")
+            # Every other RUNNING session on this model gets the ceiling now, not at its next
+            # restart — "改这个模型的，全都改掉". Cold sessions re-resolve config when restored.
+            siblings = self.session_manager.live_sessions_on_route(
+                provider, model, exclude=session_id)
+            for sibling in siblings:
+                sibling.context_budget = tokens
+                apply_context_budget(sibling.agent, tokens)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):

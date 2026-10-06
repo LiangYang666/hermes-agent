@@ -9,6 +9,7 @@ from __future__ import annotations
 from hermes_constants import get_hermes_home, translate_cwd_for_wsl_backend, windows_path_to_wsl
 
 import copy
+import contextlib
 import json
 import logging
 import os
@@ -198,6 +199,79 @@ def apply_context_budget(agent, tokens: Optional[int]) -> bool:
     return True
 
 
+def model_window_pin(provider: str, model: str) -> Optional[int]:
+    """The window THIS (provider, model) is pinned to in config.yaml, or None when unpinned.
+
+    Reads the runtime's own explicit-override step (``model_overrides.<provider>.<model>.
+    context_window``, model_metadata resolution 0b) rather than the catalog: a models.dev number is
+    not a setting, and advertising it would make the picker's ``currentValue`` claim a window nobody
+    chose. Deliberately not ``lookup_models_dev_context``, which falls back to catalog/``_default``.
+    """
+    provider, model = str(provider or "").strip(), str(model or "").strip()
+    if not provider or not model:
+        return None
+    with contextlib.suppress(Exception):
+        from agent.models_dev import _override_context_window
+
+        return _override_context_window(provider, model)
+    return None
+
+
+def write_model_window_pin(provider: str, model: str, tokens: Optional[int]) -> bool:
+    """Persist (or clear) the window for one (provider, model) in config.yaml; True when written.
+
+    Global on purpose: this is the pin every Hermes runtime reads at resolution 0b — the TUI, the
+    gateway, another ACP slot, a plain CLI run — so the window belongs to the MODEL, not to the
+    session that happened to set it. ``tokens=None`` removes the key, and any provider/model
+    scaffolding left empty with it, so ``auto`` is indistinguishable from never having chosen one.
+
+    Print-free under the config lock: stdout carries the ACP JSON-RPC stream (see ``entry.py``), so
+    ``set_config_value`` — which prints its result — is unusable from inside a session.
+    """
+    provider, model = str(provider or "").strip(), str(model or "").strip()
+    if not provider or not model:
+        return False
+    try:
+        from hermes_cli import config as config_mod
+
+        if config_mod.is_managed():
+            # Managed installs own config.yaml; the in-memory pin still applies.
+            logger.info("model_overrides is administrator-managed; the window stays session-scoped")
+            return False
+        with config_mod._CONFIG_LOCK:  # noqa: SLF001 — the lock every config writer holds
+            config_path = config_mod.get_config_path()
+            config = config_mod.require_readable_config_before_write(config_path)  # fail-closed read
+            overrides = config.get("model_overrides")
+            overrides = dict(overrides) if isinstance(overrides, dict) else {}
+            section = overrides.get(provider)
+            section = dict(section) if isinstance(section, dict) else {}
+            entry = section.get(model)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            if tokens is not None:
+                entry["context_window"] = int(tokens)
+            else:
+                entry.pop("context_window", None)
+            # Never leave empty scaffolding: `auto` must read back as "nothing was ever set".
+            if entry:
+                section[model] = entry
+            else:
+                section.pop(model, None)
+            if section:
+                overrides[provider] = section
+            else:
+                overrides.pop(provider, None)
+            if overrides:
+                config["model_overrides"] = overrides
+            else:
+                config.pop("model_overrides", None)
+            config_mod._write_user_config(config_path, config)  # noqa: SLF001 — atomic writer
+        return True
+    except Exception:
+        logger.warning("Could not write the context window for %s/%s to config.yaml; the pick stays "
+                       "session-scoped", provider, model, exc_info=True)
+        return False
+
+
 class SessionManager:
     """Thread-safe manager for ACP sessions backed by Hermes AIAgent instances.
 
@@ -262,6 +336,35 @@ class SessionManager:
             state.reasoning_config = parent_reasoning
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
+
+    def live_sessions_on_route(
+        self, provider: str, model: str, *, exclude: str = ""
+    ) -> List[SessionState]:
+        """Running sessions whose route is (provider, model) — the ones a model-scoped change must reach.
+
+        A window pinned for a model applies to every session running that model, so the session that
+        set it is not the only one to update: its siblings on the same route get the new ceiling
+        immediately instead of quietly compressing against the old one until they are restarted.
+        Cold rows are deliberately excluded — they re-resolve config when restored.
+        """
+        provider = str(provider or "").strip()
+        model = str(model or "").strip()
+        if not model:
+            return []
+        with self._lock:
+            states = list(self._sessions.values())
+        out: List[SessionState] = []
+        for state in states:
+            if state.session_id == exclude:
+                continue
+            route_provider = str(getattr(state.agent, "provider", "") or "").strip()
+            route_model = str(getattr(state.agent, "model", "") or state.model or "").strip()
+            if route_model != model:
+                continue
+            if provider and route_provider and route_provider != provider:
+                continue  # same slug, different provider: the other route's pin does not apply
+            out.append(state)
+        return out
 
     def list_sessions(self, cwd: str | None = None) -> List[Dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""
@@ -534,6 +637,13 @@ class SessionManager:
                                     history, persist=False, mode=restored_mode)
         if restored_reasoning is not None:
             state.reasoning_config = restored_reasoning
+        # The model's pin wins over the session's stored mirror: another session may have changed the
+        # window for this model while this one was cold, and the config.yaml value is what the agent
+        # was just constructed with (resolution 0b). Only a pinless model falls back to the mirror.
+        restored_budget = model_window_pin(
+            str(getattr(agent, "provider", "") or ""),
+            str(getattr(agent, "model", "") or model or ""),
+        ) or restored_budget
         if restored_budget is not None:
             state.context_budget = restored_budget
             apply_context_budget(agent, restored_budget)
