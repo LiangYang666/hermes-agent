@@ -185,3 +185,83 @@ def test_legacy_row_restores_to_auto(real_make_agent):
     assert restored is not None
     assert restored.context_budget is None
     assert _budget_option(HermesACPAgent(session_manager=manager), restored).current_value == "auto"
+
+
+class TestFreeFormBudget:
+    """The presets are shortcuts, not the allowed set: any window the operator types must work.
+
+    A closed dropdown is the reason the raw protocol has a custom-type slot at all (ACP reserves
+    ``_``-prefixed names for implementation-specific option kinds). Until the adapter speaks the
+    version that carries that variant, the same intent is expressed inside a v1 select: ``_meta``
+    describes the free-form shape for clients that read it, and the session's own pick is echoed
+    back as an option so ``currentValue`` stays inside the advertised set for clients that do not.
+    """
+
+    def test_freeform_and_presets_are_advertised(self):
+        acp_agent = HermesACPAgent(session_manager=_make_manager(RecordingDb()))
+        opt = _budget_option(acp_agent, _live_session(_make_manager(RecordingDb())))
+
+        assert opt.category == "_context_window", \
+            "a `_`-prefixed category is the protocol's slot for a custom option kind"
+        meta = opt.field_meta
+        assert meta["freeform"] is True, "without this a client has no reason to offer an input"
+        assert meta["unit"] == "tokens"
+        assert meta["min"] == HermesACPAgent._CONTEXT_BUDGET_MIN_TOKENS
+        assert meta["presets"] == [65536, 131072, 200000, 400000, 1000000], \
+            "presets must stay available as shortcuts next to the input"
+
+    def test_a_hand_typed_window_is_accepted_and_echoed_as_an_option(self):
+        db = RecordingDb()
+        manager = _make_manager(db, FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = _live_session(manager)
+
+        asyncio.run(acp_agent.set_config_option(
+            config_id="context_budget", session_id=state.session_id, value="300000"))
+
+        opt = _budget_option(acp_agent, state)
+        assert state.context_budget == 300_000
+        assert opt.current_value == "300000"
+        values = [o.value for o in opt.options]
+        assert "300000" in values, \
+            "currentValue must be one of the advertised values or the list is lying"
+        presets = [v for v, _ in HermesACPAgent._CONTEXT_BUDGET_CHOICES]
+        assert all(p in values for p in presets), \
+            "echoing the custom pick must not push the presets out"
+        assert next(o.name for o in opt.options if o.value == "300000").endswith("(custom)")
+        assert json.loads(db.rows[state.session_id]["model_config"])["context_budget"] == 300_000
+
+    def test_preset_picks_do_not_grow_the_option_list(self):
+        manager = _make_manager(RecordingDb(), FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = _live_session(manager)
+
+        asyncio.run(acp_agent.set_config_option(
+            config_id="context_budget", session_id=state.session_id, value="131072"))
+
+        opt = _budget_option(acp_agent, state)
+        assert [o.value for o in opt.options] == [v for v, _ in HermesACPAgent._CONTEXT_BUDGET_CHOICES]
+
+    def test_below_the_floor_is_refused(self):
+        manager = _make_manager(RecordingDb(), FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = _live_session(manager)
+
+        with pytest.raises(Exception):
+            asyncio.run(acp_agent.set_config_option(
+                config_id="context_budget", session_id=state.session_id, value="4096"))
+        assert state.context_budget is None, "a window the fixed prompt overflows must not be pinned"
+
+    def test_hand_typed_window_round_trips_through_restore(self, real_make_agent):
+        db = RecordingDb()
+        db.rows["budget-9"] = {
+            "id": "budget-9", "source": "acp", "model": "qwen3.8-flash",
+            "model_config": json.dumps({"cwd": ".", "context_budget": 300_000}),
+        }
+        manager = SessionManager(db=db)
+        manager._get_db = lambda: db
+
+        restored = manager.get_session("budget-9")
+        assert restored is not None and restored.context_budget == 300_000
+        opt = _budget_option(HermesACPAgent(session_manager=manager), restored)
+        assert opt.current_value == "300000" and "300000" in [o.value for o in opt.options]

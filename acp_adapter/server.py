@@ -250,6 +250,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         ("400000", "400K"),
         ("1000000", "1M"),
     )
+    # Presets are shortcuts, not the allowed set: the option accepts any token count
+    # (``_meta.freeform`` tells a client to offer an input alongside them). `_`-prefixed category
+    # is the protocol's reserved slot for implementation-specific option kinds.
+    _CONTEXT_BUDGET_CATEGORY = "_context_window"
+    _CONTEXT_BUDGET_MIN_TOKENS = 16_384
     # ACP display labels for ladder levels (the CLI /reasoning picker's equivalents).
     _EFFORT_LABELS = {"none": "Off", "minimal": "Minimal", "low": "Low", "medium": "Medium",
                       "high": "High", "xhigh": "Extra high", "max": "Max", "ultra": "Ultra"}
@@ -313,10 +318,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
 
-    @staticmethod
-    def _parse_context_budget(value: Any) -> "int | None":
-        """``auto``/empty → None (follow the model's own window); ``200000``/``64k`` → that many
-        tokens. Rejects anything else rather than guessing a ceiling the operator did not ask for.
+    @classmethod
+    def _parse_context_budget(cls, value: Any) -> "int | None":
+        """``auto``/empty → None (follow the model's own window); ``200000``/``64k``/``0.5m`` → that
+        many tokens. Free-form on purpose: the option advertises presets, not a closed set, so any
+        positive count is accepted; below ``_CONTEXT_BUDGET_MIN_TOKENS`` it is refused rather than
+        pinning a window the fixed prompt alone would overflow.
         """
         raw = str(value or "").strip().lower().replace("_", "").replace(" ", "")
         if raw in {"", "auto", "none", "model", "default", "null"}:
@@ -335,10 +342,21 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
             raise RequestError.invalid_params(
                 {"details": f"unknown context budget {value!r}; use \"auto\" or a positive token count"})
+        if tokens < cls._CONTEXT_BUDGET_MIN_TOKENS:
+            from acp.exceptions import RequestError
+
+            raise RequestError.invalid_params(
+                {"details": f"context budget {tokens} is below the {cls._CONTEXT_BUDGET_MIN_TOKENS}-token "
+                            f"floor; the fixed prompt and tool schemas alone exceed it"})
         return tokens
 
     def _build_config_options(self, state: SessionState) -> "list[Any]":
         """Typed ACP config surface: the session's thinking depth and context budget, as selects.
+
+        The budget advertises presets plus ``_meta.freeform`` — a superset of a closed dropdown, so
+        a client that understands it can offer any token count while a plain one still gets a
+        working list (a hand-typed window is echoed back as its own option, keeping ``currentValue``
+        inside the advertised set).
 
         Options are exactly ``route_offered_efforts(provider, model)`` — the levels this route's
         wire really takes. Advertising a wider vocabulary is what makes a cockpit's picker lie:
@@ -364,6 +382,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 # An out-of-route stored value maps to "" (follow the wire default) rather
                 # than selecting a choice the picker never advertised.
                 current = raw if raw in supported else ""
+        budget = getattr(state, "context_budget", None)
+        current_budget = str(budget) if budget else "auto"
+        budget_options = [SessionConfigSelectOption(value=v, name=n)
+                          for v, n in self._CONTEXT_BUDGET_CHOICES]
+        if current_budget not in {v for v, _ in self._CONTEXT_BUDGET_CHOICES}:
+            # A hand-typed window must appear among the options: ACP requires `currentValue` to be
+            # one of the advertised values, so echoing the session's own pick is what lets the
+            # cockpit offer a free-form input without the list lying about what is set.
+            budget_options.append(SessionConfigSelectOption(
+                value=current_budget, name=f"{current_budget} (custom)"))
         return [SessionConfigOptionSelect(
             id=self._REASONING_EFFORT_CONFIG_ID,
             name="Thinking depth",
@@ -378,9 +406,22 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             name="Context budget",
             description="The window Hermes budgets and compresses against (session-scoped).",
             type="select",
-            current_value=(str(budget) if (budget := getattr(state, "context_budget", None))
-                           else "auto"),
-            options=[SessionConfigSelectOption(value=v, name=n) for v, n in self._CONTEXT_BUDGET_CHOICES],
+            current_value=current_budget,
+            options=budget_options,
+            # `_`-prefixed category = the protocol's own slot for implementation-specific options
+            # (ACP: non-`_` names are reserved for the spec). `_meta` carries the extra shape a
+            # plain select cannot express — clients that understand it render a number input and
+            # preset shortcuts; clients that do not (e.g. Zed) still get a honest dropdown.
+            category=self._CONTEXT_BUDGET_CATEGORY,
+            field_meta={
+                "freeform": True,
+                "unit": "tokens",
+                "min": self._CONTEXT_BUDGET_MIN_TOKENS,
+                "step": 1024,
+                "presets": [int(v) for v, _ in self._CONTEXT_BUDGET_CHOICES if v != "auto"],
+                "note": "Any positive token count. Narrows the window Hermes compresses at; "
+                        "it cannot raise it above the model's own.",
+            },
         )]
 
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
