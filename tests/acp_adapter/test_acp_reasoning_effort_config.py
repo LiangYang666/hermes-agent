@@ -219,3 +219,52 @@ def test_session_response_fields_carry_config_options():
     fields = asyncio.run(acp_agent._session_response_fields(state))
     assert "config_options" in fields
     assert any(o.id == "reasoning_effort" for o in fields["config_options"])
+
+@pytest.mark.parametrize("provider,model,expected", [
+    # 千问 3.8 Flash/Max (DashScope): reasoning_effort takes exactly low/medium/xhigh, and thinking
+    # is switched off with enable_thinking=false — so "Off" is a real level and "High"/"Max" are
+    # aliases of xhigh, not levels of their own. Offering the seven-level vocabulary here was the
+    # bug: four picks folded away on the wire and the setting read as "does nothing" (2026-10-06).
+    ("alibaba", "qwen3.8-flash", ("none", "low", "medium", "xhigh")),
+    ("alibaba-cn", "qwen3.8-max", ("none", "low", "medium", "xhigh")),
+    ("alibaba-token-plan", "qwen/qwen3.8-flash", ("none", "low", "medium", "xhigh")),
+    # DeepSeek V4 on either host: low..max plus the thinking toggle.
+    ("deepseek", "deepseek-v4-pro", ("none", "low", "medium", "high", "max")),
+    ("alibaba", "deepseek-v4-pro", ("none", "low", "medium", "high", "max")),
+    # A route we have not verified keeps every level: taking choices away is the worse error.
+    ("openrouter", "some-unknown-model", OPENAI_COMPAT_WIRE_EFFORTS),
+])
+def test_advertises_only_the_levels_the_route_really_takes(provider, model, expected):
+    """The picker shows what the wire takes — nothing it would silently fold away."""
+    db = RecordingDb()
+    fake = FakeAgent()
+    fake.provider, fake.model = provider, model
+    manager = _make_manager(db, fake)
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = _live_session(manager)
+
+    opt = _effort_option(acp_agent, state)
+    assert opt is not None
+    assert tuple(o.value for o in opt.options) == tuple(expected), \
+        f"{provider}/{model} advertises a ladder its wire does not accept"
+    labels = {o.value: o.name for o in opt.options}
+    assert labels.get("none") == "Off", "the toggle must be reachable from the picker"
+    if "high" not in expected:
+        assert "High" not in labels.values(), "an alias level must not be offered as its own choice"
+
+
+def test_deepseek_keeps_a_level_the_entry_clamp_still_accepts():
+    """Validation stays the (wide) entry clamp while the picker narrows: the CLI/TUI have always
+    sent xhigh to DeepSeek, whose profile maps it onto max — that must keep working."""
+    db = RecordingDb()
+    fake = FakeAgent()
+    fake.provider, fake.model = "deepseek", "deepseek-v4-pro"
+    manager = _make_manager(db, fake)
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = _live_session(manager)
+
+    assert "xhigh" not in [o.value for o in _effort_option(acp_agent, state).options]
+    asyncio.run(acp_agent.set_config_option(
+        config_id="reasoning_effort", session_id=state.session_id, value="xhigh"))
+    assert fake.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
