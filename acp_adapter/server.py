@@ -250,11 +250,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     # keeps every pick reversible.
     _CONTEXT_BUDGET_CHOICES: tuple[tuple[str, str], ...] = (
         ("auto", "Auto (model window)"),
-        ("65536", "64K"),
-        ("131072", "128K"),
-        ("200000", "200K"),
-        ("400000", "400K"),
-        ("1000000", "1M"),
+        ("262144", "256K"),
+        ("524288", "512K"),
+        ("786432", "768K"),
+        ("1048576", "1M"),
     )
     # Presets are shortcuts, not the allowed set: the option accepts any token count
     # (``_meta.freeform`` tells a client to offer an input alongside them). `_`-prefixed category
