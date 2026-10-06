@@ -24,6 +24,7 @@ import asyncio
 import json
 
 import pytest
+import yaml
 
 from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager, apply_context_budget
@@ -265,3 +266,100 @@ class TestFreeFormBudget:
         assert restored is not None and restored.context_budget == 300_000
         opt = _budget_option(HermesACPAgent(session_manager=manager), restored)
         assert opt.current_value == "300000" and "300000" in [o.value for o in opt.options]
+
+
+class TestTheWindowBelongsToTheModel:
+    """Operator: "改的话就改全局的…这个模型的全都全都改掉" — Studio keeps a context length per
+    provider+model and so does Hermes: the pin is ``model_overrides.<provider>.<model>.context_window``
+    in config.yaml, which every runtime reads at model_metadata resolution 0b (TUI, gateway, CLI,
+    another slot). A pick therefore outlives the session that made it, and the sessions already
+    running that model follow it immediately instead of at their next restart."""
+
+    @pytest.fixture(autouse=True)
+    def home(self, tmp_path, monkeypatch):
+        """One HERMES_HOME per test: the pick now lands in config.yaml, so a shared home would hand
+        the next test an already-pinned model."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        return tmp_path
+
+    def _set(self, acp_agent, state, value):
+        return asyncio.run(acp_agent.set_config_option(
+            config_id="context_budget", session_id=state.session_id, value=value))
+
+    def _manager_with_compressors(self, db):
+        return SessionManager(agent_factory=lambda **_kw: _agent_with_compressor(), db=db)
+
+    def test_the_pick_is_written_for_the_provider_and_model(self, home):
+        manager = _make_manager(RecordingDb(), FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = _live_session(manager)
+
+        self._set(acp_agent, state, "300000")
+
+        written = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        assert written["model_overrides"]["fake-provider"]["fake-model"]["context_window"] == 300_000, \
+            "the window must be a property of the model, not of the session that set it"
+
+    def test_the_runtime_resolves_the_pinned_window(self, home):
+        """The proof that this is the real knob: the call a fresh session makes returns the pick."""
+        manager = _make_manager(RecordingDb(), FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = _live_session(manager)
+        self._set(acp_agent, state, "300000")
+
+        from agent.model_metadata import get_model_context_length
+
+        assert get_model_context_length("fake-model", provider="fake-provider") == 300_000
+
+    def test_a_session_that_never_picked_inherits_the_model_pin(self, home):
+        db = RecordingDb()
+        manager = _make_manager(db, FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        first = _live_session(manager)
+        self._set(acp_agent, first, "300000")
+
+        second = _live_session(manager)  # nothing was ever set on this one
+
+        assert second.context_budget is None, "the pick is not copied onto the session"
+        assert _budget_option(acp_agent, second).current_value == "300000", \
+            "a session on a pinned model must show that window, not 'auto'"
+
+    def test_a_running_sibling_is_repinned_immediately(self, home):
+        db = RecordingDb()
+        manager = self._manager_with_compressors(db)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        first = _live_session(manager)
+        sibling = _live_session(manager)
+        assert sibling.agent.context_compressor.context_length == 200_000
+
+        self._set(acp_agent, first, "300000")
+
+        assert sibling.context_budget == 300_000
+        assert sibling.agent.context_compressor.context_length == 300_000, \
+            "a sibling session would otherwise keep compressing against the old window"
+
+    def test_auto_removes_the_pin_and_its_scaffolding(self, home):
+        db = RecordingDb()
+        manager = _make_manager(db, FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = _live_session(manager)
+        self._set(acp_agent, state, "300000")
+
+        self._set(acp_agent, state, "auto")
+
+        written = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+        assert "model_overrides" not in written, \
+            "`auto` must read back as 'never set', not as empty provider scaffolding"
+        assert _budget_option(acp_agent, state).current_value == "auto"
+
+    def test_other_models_of_the_same_provider_are_untouched(self, home):
+        db = RecordingDb()
+        manager = _make_manager(db, FakeAgent())
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = _live_session(manager)
+
+        self._set(acp_agent, state, "300000")
+
+        written = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        assert list(written["model_overrides"]["fake-provider"]) == ["fake-model"], \
+            "pinning one model must not write a section the runtime would read for its neighbours"
