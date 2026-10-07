@@ -383,6 +383,9 @@
   "api_mode": "chat_completions",
   "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
   "high": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": [
@@ -473,6 +476,9 @@
   },
   "model": "qwen3.5-plus",
   "off": {
+   "extra_body": {
+    "enable_thinking": false
+   },
    "messages": [
     {
      "content": [
@@ -562,6 +568,9 @@
    ]
   },
   "unset": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": [
@@ -655,6 +664,9 @@
   "api_mode": "chat_completions",
   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "high": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -713,6 +725,9 @@
   },
   "model": "qwen3.5-plus",
   "off": {
+   "extra_body": {
+    "enable_thinking": false
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -770,6 +785,9 @@
    ]
   },
   "unset": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -831,6 +849,9 @@
   "api_mode": "chat_completions",
   "base_url": "https://coding-intl.dashscope.aliyuncs.com/v1",
   "high": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -889,6 +910,9 @@
   },
   "model": "qwen3-coder-plus",
   "off": {
+   "extra_body": {
+    "enable_thinking": false
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -946,6 +970,9 @@
    ]
   },
   "unset": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1007,6 +1034,9 @@
   "api_mode": "chat_completions",
   "base_url": "https://coding.dashscope.aliyuncs.com/v1",
   "high": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1065,6 +1095,9 @@
   },
   "model": "qwen3-coder-plus",
   "off": {
+   "extra_body": {
+    "enable_thinking": false
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1122,6 +1155,9 @@
    ]
   },
   "unset": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1183,6 +1219,9 @@
   "api_mode": "chat_completions",
   "base_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
   "high": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1241,6 +1280,9 @@
   },
   "model": "qwen3.5-plus",
   "off": {
+   "extra_body": {
+    "enable_thinking": false
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1298,6 +1340,9 @@
    ]
   },
   "unset": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1359,6 +1404,9 @@
   "api_mode": "chat_completions",
   "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
   "high": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1417,6 +1465,9 @@
   },
   "model": "qwen3.5-plus",
   "off": {
+   "extra_body": {
+    "enable_thinking": false
+   },
    "messages": [
     {
      "content": "You are a test agent.",
@@ -1474,6 +1525,9 @@
    ]
   },
   "unset": {
+   "extra_body": {
+    "enable_thinking": true
+   },
    "messages": [
     {
      "content": "You are a test agent.",
