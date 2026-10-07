@@ -231,6 +231,18 @@ def test_session_response_fields_carry_config_options():
     # DeepSeek V4 on either host: low..max plus the thinking toggle.
     ("deepseek", "deepseek-v4-pro", ("none", "low", "medium", "high", "max")),
     ("alibaba", "deepseek-v4-pro", ("none", "low", "medium", "high", "max")),
+    # Coding Plan — the AgentSlot route — shipped as a bare ProviderProfile, so NO level reached the
+    # wire, "Off" included. Same ladders as the alibaba profiles now that it shares the translation.
+    ("alibaba-coding-plan", "deepseek-v4.1-flash", ("none", "low", "medium", "high", "max")),
+    ("alibaba-coding-plan", "qwen3.8-flash", ("none", "low", "medium", "xhigh")),
+    # Qwen 3.7/3.6 have hybrid thinking but no graded knob (live-verified 2026-10-07): offering
+    # 3.8's tiers would be three picks that change nothing.
+    ("alibaba", "qwen3.7-max", ("none", "medium")),
+    ("alibaba-coding-plan", "qwen3.6-flash", ("none", "medium")),
+    # 阿里云直供 GLM: 5.2 has the full ladder, 5.3 always thinks and 400s on enable_thinking=false —
+    # so "Off" is not a choice there, and low/high/max is the whole vocabulary.
+    ("alibaba", "glm-5.2", ("none", "minimal", "low", "medium", "high", "xhigh", "max")),
+    ("alibaba", "glm-5.3", ("low", "high", "max")),
     # A route we have not verified keeps every level: taking choices away is the worse error.
     ("openrouter", "some-unknown-model", OPENAI_COMPAT_WIRE_EFFORTS),
 ])
@@ -248,7 +260,11 @@ def test_advertises_only_the_levels_the_route_really_takes(provider, model, expe
     assert tuple(o.value for o in opt.options) == tuple(expected), \
         f"{provider}/{model} advertises a ladder its wire does not accept"
     labels = {o.value: o.name for o in opt.options}
-    assert labels.get("none") == "Off", "the toggle must be reachable from the picker"
+    if "none" in expected:
+        assert labels.get("none") == "Off", "the toggle must be reachable from the picker"
+    else:
+        assert "Off" not in labels.values(), \
+            "an unswitchable route must not offer a pick that 400s the request"
     if "high" not in expected:
         assert "High" not in labels.values(), "an alias level must not be offered as its own choice"
 

@@ -13,7 +13,7 @@ rejects a level fix its declared set, never a predicate.
 from __future__ import annotations
 
 import re
-from typing import Optional, Sequence
+from typing import Any, NamedTuple, Optional, Sequence
 
 #: Matches ``k3`` as a delimited token (``k3``, ``k3-256k``, ``kimi-k3-cot``), never K2-era names (``kimi-k2.6``).
 # From #76427 by @ruizanthony.
@@ -88,6 +88,24 @@ DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 QWEN38_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "xhigh")
 QWEN38_OVERRIDES: dict[str, str] = {"minimal": "low", "high": "xhigh", "max": "xhigh"}
 
+#: Qwen 3.7 / 3.6 / 3.5 hybrids on DashScope: hybrid thinking (``enable_thinking`` switches it on
+#: and off), but the GRADED knob ships with 3.8 only. Live-verified 2026-10-07 on the token-plan
+#: endpoint: ``reasoning_effort: low`` reasons like no knob at all (qwen3.7-max 60 vs 61 reasoning
+#: tokens, qwen3.6-flash 599 vs 576) while ``max`` is an HTTP 400 ("'reasoning_effort' must be one
+#: of: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'"). Advertising 3.8's tiers here is the
+#: very "the setting does nothing" bug this vocabulary exists to prevent, so the ladder is ``none``
+#: (the off switch) plus one "on" level — which the profile deliberately never puts on the wire.
+QWEN_TOGGLE_ONLY_EFFORTS: tuple[str, ...] = ("none", "medium")
+
+#: 阿里云直供 GLM on DashScope. Host-scoped on purpose: the vendor's own API publishes narrower
+#: sets for the same ids (``GLM52_EFFORTS``), so neither constant may stand in for the other.
+#: glm-5.2/5.1/5 document the full OpenAI ladder (live: 300 reasoning tokens at ``low`` vs 398 at
+#: ``max``); glm-5.3 takes exactly low/high/max and ALWAYS thinks — ``enable_thinking: false`` is
+#: an HTTP 400 ("The value of the enable_thinking parameter is restricted to True", live-verified
+#: 2026-10-07).
+DASHSCOPE_GLM_EFFORTS: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+DASHSCOPE_GLM53_EFFORTS: tuple[str, ...] = ("low", "high", "max")
+
 #: Levels a wire takes when it also owns the thinking toggle (DeepSeek V4, Qwen 3.8 on DashScope):
 #: ``none`` is not an effort, it is ``thinking: disabled`` — but a picker has to offer it as one
 #: level or the operator cannot turn thinking off at all.
@@ -106,18 +124,44 @@ _ROUTE_EFFORTS: dict[str, tuple[str, ...]] = {
     "alibaba-cloud-cn": QWEN38_EFFORTS,
     "alibaba-token-plan": QWEN38_EFFORTS,
     "alibaba-token-plan-cn": QWEN38_EFFORTS,
+    "alibaba-coding-plan": QWEN38_EFFORTS,
+    "alibaba-coding-plan-cn": QWEN38_EFFORTS,
     "dashscope": QWEN38_EFFORTS,
     "dashscope-cn": QWEN38_EFFORTS,
     "qwen-dashscope": QWEN38_EFFORTS,
     "aliyun": QWEN38_EFFORTS,
 }
 
+#: DashScope-hosted routes. The host itself decides nothing about thinking (one endpoint fronts
+#: Qwen, DeepSeek, GLM and Kimi with different knobs), but it DOES own which GLM ladder applies —
+#: the vendor's own API publishes a narrower one for the same ids — so the host-scoped table below
+#: is consulted only for these routes, and vendor-prefixed ids (``qwen/qwen3.8-flash``) are
+#: recognised as the family they name.
+_DASHSCOPE_ROUTES: frozenset[str] = frozenset({
+    "alibaba", "alibaba-cn", "alibaba-cloud", "alibaba-cloud-cn",
+    "alibaba-token-plan", "alibaba-token-plan-cn",
+    "alibaba-coding-plan", "alibaba-coding-plan-cn",
+    "dashscope", "dashscope-cn", "qwen-dashscope", "aliyun",
+})
+
 #: Model ids whose OWN wire is narrower than their host's, so the ladder follows the model rather
 #: than the host (a DashScope endpoint serves Qwen, DeepSeek and GLM with different ladders).
+#: Longest prefix first: ``qwen3.8`` is the only Qwen generation with the graded knob, so it must
+#: resolve before the ``qwen3`` catch-all.
 _MODEL_ROUTE_EFFORTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("deepseek-v4", DEEPSEEK_ROUTE_EFFORTS),
-    ("qwen3", QWEN38_EFFORTS),
-    ("qwen-3", QWEN38_EFFORTS),
+    ("qwen3.8", QWEN38_EFFORTS),
+    ("qwen-3.8", QWEN38_EFFORTS),
+    ("qwen3", QWEN_TOGGLE_ONLY_EFFORTS),
+    ("qwen-3", QWEN_TOGGLE_ONLY_EFFORTS),
+)
+
+#: DashScope-supplied families whose ladder the HOST decides: the same ``glm-5.3`` id takes
+#: low/high/max from 阿里云直供 and a different set from the vendor's API, so only a DashScope route
+#: may resolve through here. Ordered longest-prefix-first for the same reason as above.
+_DASHSCOPE_MODEL_EFFORTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("glm-5.3", DASHSCOPE_GLM53_EFFORTS),
+    ("glm-5", DASHSCOPE_GLM_EFFORTS),
 )
 
 
@@ -130,17 +174,26 @@ def route_offered_efforts(provider: Optional[str], model: Optional[str]) -> tupl
     advertising: a cockpit renders exactly these, so a level we offer but the wire folds away is
     the bug the operator reports as "the setting does nothing".
 
-    Model first: the same DashScope host serves Qwen (``low``/``medium``/``xhigh``), DeepSeek
-    (``low``..``max``) and GLM (thinking-only, no off switch), so the model id — not the host —
-    decides the ladder. Then the provider profile name (plus its aliases), then the widest
-    vocabulary, so an unverified route never loses choices.
+    Model first: the same DashScope host serves Qwen (``low``/``medium``/``xhigh`` on 3.8, toggle
+    only before it), DeepSeek (``low``..``max``) and GLM (``low``/``high``/``max`` on 5.3, which
+    cannot be switched off at all), so the model id — not the host — decides the ladder. Then the
+    provider profile name (plus its aliases), then the widest vocabulary, so an unverified route
+    never loses choices.
     """
-    m = (model or "").strip().lower()
-    if m:
-        for prefix, levels in _MODEL_ROUTE_EFFORTS:
-            if m.startswith(prefix):
-                return levels
     p = (provider or "").strip().lower()
+    m = (model or "").strip().lower()
+    on_dashscope = p in _DASHSCOPE_ROUTES
+    # DashScope serves vendor-prefixed ids (``qwen/qwen3.8-flash``); off that host the full id is
+    # the only thing we can key on, so the prefix is stripped for DashScope routes alone.
+    key = m.rsplit("/", 1)[-1] if (on_dashscope and "/" in m) else m
+    if key:
+        for prefix, levels in _MODEL_ROUTE_EFFORTS:
+            if key.startswith(prefix):
+                return levels
+    if on_dashscope and key:
+        for prefix, levels in _DASHSCOPE_MODEL_EFFORTS:
+            if key.startswith(prefix):
+                return levels
     return _ROUTE_EFFORTS.get(p, OPENAI_COMPAT_WIRE_EFFORTS)
 
 #: Ollama Cloud /v1/chat/completions: rejects ``minimal`` with HTTP 400.
@@ -278,6 +331,86 @@ def thinking_toggle_extras(
     if clamped in efforts:
         return ({"thinking": {"type": "enabled"}} if always_emit_toggle else {}), {"reasoning_effort": clamped}
     return {"thinking": {"type": "enabled"}}, {}
+
+
+class _DashScopeThinking(NamedTuple):
+    """What one DashScope-served family's thinking wire accepts."""
+
+    efforts: Optional[tuple[str, ...]]  # None → the toggle IS the contract (Qwen 3.7/3.6/3.5)
+    overrides: Optional[dict[str, str]] = None
+    thinking_only: bool = False  # no off switch: ``enable_thinking: false`` is an HTTP 400
+
+
+#: Model prefix → thinking contract, longest prefix first. One DashScope OpenAI-compatible endpoint
+#: fronts several vendors whose knobs genuinely differ, so this is keyed by MODEL (``qwen3.8``
+#: ahead of the ``qwen3`` catch-all, ``glm-5.3`` ahead of ``glm-5``). A family absent here gets NO
+#: parameter at all: an unwarranted ``enable_thinking: false`` 400s on the thinking-only ids we have
+#: not enumerated, and inventing an effort a family does not read is the silent no-op (an operator
+#: picking a level that changes nothing) this module exists to prevent. Families deliberately left
+#: out because their contract differs by SUPPLIER, not just by name — 阿里直供 kimi-k3 documents
+#: low/high/max while 月之暗面直供 kimi-k3 documents ``max`` alone, MiniMax uses
+#: ``thinking: adaptive|disabled`` instead of these two parameters, and Stepfun defaults to OFF —
+#: get no parameter at all rather than a guess that could 400.
+_DASHSCOPE_THINKING: tuple[tuple[str, _DashScopeThinking], ...] = (
+    ("deepseek-v4", _DashScopeThinking(DEEPSEEK_V4_EFFORTS, DEEPSEEK_V4_OVERRIDES)),
+    ("qwen3.8", _DashScopeThinking(QWEN38_EFFORTS, QWEN38_OVERRIDES)),
+    ("qwen-3.8", _DashScopeThinking(QWEN38_EFFORTS, QWEN38_OVERRIDES)),
+    ("qwen3", _DashScopeThinking(None)),
+    ("qwen-3", _DashScopeThinking(None)),
+    ("glm-5.3", _DashScopeThinking(DASHSCOPE_GLM53_EFFORTS, thinking_only=True)),
+    ("glm-5", _DashScopeThinking(DASHSCOPE_GLM_EFFORTS)),
+)
+
+
+def dashscope_model_thinking(model: Optional[str]) -> Optional[_DashScopeThinking]:
+    """Thinking contract for a DashScope-served model id, or None for a family we have not verified."""
+    m = (model or "").strip().lower()
+    if "/" in m:  # vendor-prefixed ids (``qwen/qwen3.8-flash``)
+        m = m.rsplit("/", 1)[-1]
+    for prefix, spec in _DASHSCOPE_THINKING:
+        if m.startswith(prefix):
+            return spec
+    return None
+
+
+def dashscope_thinking_extras(reasoning_config: Optional[dict], model: Optional[str]) -> dict[str, Any]:
+    """Translate a reasoning config onto DashScope's ``extra_body`` thinking parameters.
+
+    ``enable_thinking`` is the only real off switch and ``reasoning_effort`` carries the grade,
+    clamped onto what the family's wire takes; ``thinking_budget`` is mutually exclusive with
+    ``reasoning_effort`` and is never emitted. Two per-family rules live here:
+
+    * a toggle-only family (Qwen 3.7/3.6/3.5) never sees an effort — its wire has none — so the
+      picker's "on" level resolves to a bare ``enable_thinking: true``;
+    * a thinking-only family (glm-5.3) never sees ``false`` (HTTP 400). An "off" ask lands on its
+      lightest level, the closest honest match: live, glm-5.3 at ``low`` returns zero reasoning
+      tokens.
+
+    Shared by every DashScope profile (``alibaba``, its token-plan/coding-plan tiers), which is why
+    it lives here next to the ladders it clamps onto rather than in one of them.
+    """
+    spec = dashscope_model_thinking(model)
+    if spec is None:
+        return {}
+    disabled = isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False
+    ask = requested_effort(reasoning_config)
+    extras: dict[str, Any] = {"enable_thinking": True}
+    if spec.thinking_only:
+        efforts = spec.efforts or ()
+        if disabled or ask == "none":
+            ask = "low"
+        clamped = clamp_effort(ask, efforts, spec.overrides)
+        if clamped in efforts:
+            extras["reasoning_effort"] = clamped
+        return extras
+    if disabled:
+        return {"enable_thinking": False}
+    if spec.efforts is None:  # toggle-only family: the picked "on" level rides nothing
+        return extras
+    clamped = clamp_effort(None if ask == "none" else ask, spec.efforts, spec.overrides)
+    if clamped in spec.efforts and clamped != "none":
+        extras["reasoning_effort"] = clamped
+    return extras
 
 
 def ox_alpha_reasoning_extras(reasoning_config: Optional[dict], model: Optional[str]) -> tuple[dict, dict]:
