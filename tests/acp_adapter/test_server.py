@@ -771,3 +771,56 @@ class TestDisabledToolsetsFilterToolSurface:
         assert "execute_code" in listed()
         state.agent.disabled_toolsets = ["code_execution"]
         assert "execute_code" not in listed()
+
+
+class TestHistoryReplayPlanUpdates:
+    """Replaying persisted history re-emits ACP plan updates from todo results.
+
+    The tool was renamed ``todo`` -> ``todo_list``; old sessions persisted the old
+    name and new ones persist the new one, so both must replay into a plan update.
+    """
+
+    @pytest.mark.parametrize("tool_name", ["todo", "todo_list"])
+    def test_todo_result_replays_as_plan_update(self, tool_name):
+        from acp.schema import AgentPlanUpdate
+
+        from acp_adapter.server import _history_replay_updates
+
+        result = (
+            '{"todos":['
+            '{"id":"a","content":"Step A","status":"completed"},'
+            '{"id":"b","content":"Step B","status":"in_progress"}'
+            ']}'
+        )
+        history = [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "tc-1", "function": {"name": tool_name, "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "tc-1", "tool_name": tool_name, "content": result},
+        ]
+
+        updates = list(_history_replay_updates(history))
+        plans = [u for u in updates if isinstance(u, AgentPlanUpdate)]
+        assert len(plans) == 1
+        assert [e.content for e in plans[0].entries] == ["Step A", "Step B"]
+        assert [e.status for e in plans[0].entries] == ["completed", "in_progress"]
+
+    def test_bridge_tool_call_todo_list_replays_as_plan_update(self):
+        # Deferred todo_list persists as a ``tool_call`` bridge row whose arguments
+        # carry the underlying name; replay must unwrap it like live turns do.
+        from acp.schema import AgentPlanUpdate
+
+        from acp_adapter.server import _history_replay_updates
+
+        result = '{"todos":[{"id":"a","content":"Step A","status":"in_progress"}],"revision":1}'
+        bridge_args = '{"calls":[{"name":"todo_list","arguments":{"todos":[{"id":"a","content":"Step A","status":"in_progress"}]}}]}'
+        history = [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "tc-1", "function": {"name": "tool_call", "arguments": bridge_args}}]},
+            {"role": "tool", "tool_call_id": "tc-1", "tool_name": "tool_call", "content": result},
+        ]
+
+        updates = list(_history_replay_updates(history))
+        plans = [u for u in updates if isinstance(u, AgentPlanUpdate)]
+        assert len(plans) == 1
+        assert [e.content for e in plans[0].entries] == ["Step A"]
+

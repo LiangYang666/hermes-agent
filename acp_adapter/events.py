@@ -26,6 +26,32 @@ logger = logging.getLogger(__name__)
 # as terminal entries so the client's full-list replacement doesn't drop them.
 _PLAN_STATUS = {"pending": "pending", "in_progress": "in_progress", "completed": "completed", "cancelled": "completed"}
 
+# ``todo`` was renamed to ``todo_list`` upstream; live turns carry the new name while
+# persisted history still replays under the old one, so both spellings emit plans.
+_TODO_TOOL_NAMES = frozenset({"todo", "todo_list"})
+
+
+def _is_todo_call(tool_name: Any, arguments: Any) -> bool:
+    """True when a step-callback / replay entry names the todo tool.
+
+    Covers three shapes: the current name (``todo_list``), the pre-rename name
+    (``todo``, still in persisted history), and the tool-search bridge — a deferred
+    ``todo_list`` reaches the transcript as ``tool_call`` whose arguments carry the
+    underlying name (display layers already unwrap it; plan emission must too)."""
+    if tool_name in _TODO_TOOL_NAMES:
+        return True
+    if tool_name != "tool_call":
+        return False
+    try:
+        from tools import tool_search as _ts
+
+        underlying, _, err = _ts.resolve_underlying_call(
+            arguments if isinstance(arguments, dict) else _json_loads_maybe(arguments) or {}
+        )
+        return not err and underlying in _TODO_TOOL_NAMES
+    except Exception:
+        return False
+
 
 def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
     """Translate Hermes' todo tool result into ACP's native plan update.
@@ -291,7 +317,7 @@ def make_step_cb(
                 ))
                 if not queue:
                     tool_call_ids.pop(tool_name, None)
-            if tool_name == "todo" and (plan_update := _build_plan_update_from_todo_result(result)) is not None:
+            if _is_todo_call(tool_name, function_args) and (plan_update := _build_plan_update_from_todo_result(result)) is not None:
                 _send_update(conn, session_id, loop, plan_update)
 
     return _step

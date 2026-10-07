@@ -120,10 +120,13 @@ class TestStepCallback:
         }
         mock_send.assert_called_once()
 
-    def test_todo_completion_emits_native_plan_update_after_tool_completion(self, mock_conn, event_loop_fixture):
+    @pytest.mark.parametrize("tool_name", ["todo", "todo_list"])
+    def test_todo_completion_emits_native_plan_update_after_tool_completion(
+        self, mock_conn, event_loop_fixture, tool_name
+    ):
         from collections import deque
 
-        tool_call_ids = {"todo": deque(["tc-todo"])}
+        tool_call_ids = {tool_name: deque(["tc-todo"])}
         loop = event_loop_fixture
         cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, {})
         todo_result = (
@@ -135,7 +138,7 @@ class TestStepCallback:
         )
 
         with patch("acp_adapter.events._send_update") as mock_send:
-            cb(1, [{"name": "todo", "result": todo_result}])
+            cb(1, [{"name": tool_name, "result": todo_result}])
 
         updates = [call.args[3] for call in mock_send.call_args_list]
         assert [getattr(update, "session_update", None) for update in updates] == [
@@ -151,6 +154,31 @@ class TestStepCallback:
         ]
         assert [entry.status for entry in plan.entries] == ["completed", "in_progress", "completed"]
         assert [entry.priority for entry in plan.entries] == ["medium", "medium", "medium"]
+    def test_bridge_tool_call_of_todo_list_emits_plan_update(self, mock_conn, event_loop_fixture):
+        # Deferred tools reach the transcript through the tool_search bridge:
+        # name="tool_call", arguments={"calls": [{"name": "todo_list", ...}]}.
+        # Plan emission must unwrap the bridge like display layers do.
+        from collections import deque
+
+        tool_call_ids = {"tool_call": deque(["tc-bridge"])}
+        loop = event_loop_fixture
+        cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, {})
+        todo_result = (
+            '{"todos":[{"id":"a","content":"Say hi","status":"completed"}],'
+            '"revision":1,"summary":{"total":1}}'
+        )
+        bridge_args = (
+            '{"calls":[{"name":"todo_list","arguments":{"todos":'
+            '[{"id":"a","content":"Say hi","status":"completed"}]}}]}'
+        )
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb(1, [{"name": "tool_call", "result": todo_result, "arguments": bridge_args}])
+
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        assert [getattr(u, "session_update", None) for u in updates] == ["tool_call_update", "plan"]
+        assert [e.content for e in updates[1].entries] == ["Say hi"]
+
 
 
 
