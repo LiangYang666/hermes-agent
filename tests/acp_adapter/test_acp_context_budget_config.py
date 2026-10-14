@@ -24,7 +24,9 @@ import asyncio
 import json
 
 import pytest
-import yaml
+from ruamel.yaml import YAML
+
+_yaml = YAML(typ="safe")
 
 from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager, apply_context_budget
@@ -296,7 +298,7 @@ class TestTheWindowBelongsToTheModel:
 
         self._set(acp_agent, state, "300000")
 
-        written = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        written = _yaml.load((home / "config.yaml").read_text(encoding="utf-8"))
         assert written["model_overrides"]["fake-provider"]["fake-model"]["context_window"] == 300_000, \
             "the window must be a property of the model, not of the session that set it"
 
@@ -347,7 +349,7 @@ class TestTheWindowBelongsToTheModel:
 
         self._set(acp_agent, state, "auto")
 
-        written = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+        written = _yaml.load((home / "config.yaml").read_text(encoding="utf-8")) or {}
         assert "model_overrides" not in written, \
             "`auto` must read back as 'never set', not as empty provider scaffolding"
         assert _budget_option(acp_agent, state).current_value == "auto"
@@ -360,6 +362,6 @@ class TestTheWindowBelongsToTheModel:
 
         self._set(acp_agent, state, "300000")
 
-        written = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        written = _yaml.load((home / "config.yaml").read_text(encoding="utf-8"))
         assert list(written["model_overrides"]["fake-provider"]) == ["fake-model"], \
             "pinning one model must not write a section the runtime would read for its neighbours"

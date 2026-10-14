@@ -190,10 +190,17 @@ def test_none_disables_and_round_trips_through_restore(real_make_agent):
 def test_legacy_row_restores_to_config_default(real_make_agent, tmp_path):
     """A row persisted before this feature (no reasoning_config key) must restore cleanly and
     keep following resolve_reasoning_config — never None-shadow the default or crash."""
-    import yaml
-    (tmp_path / "config.yaml").write_text(yaml.safe_dump(
-        {"model": {"default": "gpt-5.6", "provider": "openai-api"},
-         "agent": {"reasoning_effort": "medium"}}), encoding="utf-8")
+    # ruamel.yaml, not pyyaml: it is what the checkout's dependency set pins, and what the rest of
+    # the suite writes config files with.
+    from io import StringIO
+
+    from ruamel.yaml import YAML
+
+    _yaml = YAML()
+    _buf = StringIO()
+    _yaml.dump({"model": {"default": "gpt-5.6", "provider": "openai-api"},
+                "agent": {"reasoning_effort": "medium"}}, _buf)
+    (tmp_path / "config.yaml").write_text(_buf.getvalue(), encoding="utf-8")
 
     db = RecordingDb()
     db.rows["legacy-1"] = {
