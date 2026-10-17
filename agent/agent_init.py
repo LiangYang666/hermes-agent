@@ -1266,7 +1266,11 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
         # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
         "agent_context": platform if platform in ("cron", "subagent") else "primary",
     }
-    if kwargs["platform"] == "cli":
+    # `acp` too: the ACP adapter renders status lines as `_meta.hermes` thought chunks (see
+    # `acp_adapter/events.py:make_status_cb`), so a memory provider's recall/save indicators reach the
+    # cockpit exactly like they reach the terminal. Without this the indicators no-op on ACP and the
+    # host has no way to show 「recalled 8 memories」 — it was simply never sent.
+    if kwargs["platform"] in ("cli", "acp"):
         kwargs["warning_callback"] = agent._emit_warning
         kwargs["status_callback"] = agent._emit_status
     # Session title (e.g. honcho derives chat-scoped session keys from it).

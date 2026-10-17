@@ -15,6 +15,7 @@ from acp.schema import AgentPlanUpdate
 from acp_adapter.events import (
     _send_update,
     make_message_cb,
+    make_status_cb,
     make_step_cb,
     make_thinking_cb,
     make_tool_progress_cb,
@@ -337,3 +338,63 @@ class TestToolCallsAlwaysReachATerminalStatus:
             progress("tool.completed", "terminal", None, None, is_error=True,
                      result="[Tool execution cancelled — terminal was skipped. User sent a new message]")
         assert [c.args[1].status for c in mock_conn.session_update.call_args_list] == ["failed"]
+
+
+# ---------------------------------------------------------------------------
+# make_status_cb — the memory/compaction status line (ACP has no status object)
+# ---------------------------------------------------------------------------
+
+
+class TestMakeStatusCb:
+    """`👁️ Hindsight — recalled 8 memories` has to travel as an honest ACP frame.
+
+    The assertions are about the CARRIER, because that is the part a host has to agree with: an empty
+    thought chunk whose ``_meta.hermes`` holds the sentence. A client that does not know the extension
+    renders nothing, rather than a fake line in the transcript nobody can honestly read.
+    """
+
+    def test_status_ships_as_a_meta_marked_thought_chunk(self, mock_conn, event_loop_fixture):
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb = make_status_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("lifecycle", "👁️ Hindsight — recalled 8 memories")
+
+        mock_send.assert_called_once()
+        _conn, session_id, _loop, update = mock_send.call_args.args
+        assert session_id == "session-1"
+        assert update.sessionUpdate == "agent_thought_chunk"
+        assert update.content.text == ""  # nothing is added to the conversation
+        assert update._meta == {
+            "hermes": {
+                "kind": "status",
+                "statusKind": "lifecycle",
+                "text": "👁️ Hindsight — recalled 8 memories",
+            }
+        }
+
+    def test_blank_text_sends_nothing(self, mock_conn, event_loop_fixture):
+        """An empty status is not an update: a client would otherwise see a new empty thought."""
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb = make_status_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("lifecycle", "   ")
+            cb("lifecycle", "")
+
+        mock_send.assert_not_called()
+
+    def test_unknown_kind_defaults_to_lifecycle(self, mock_conn, event_loop_fixture):
+        """Hermes routes warnings through the same channel; an unlabelled one is still a status."""
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb = make_status_cb(mock_conn, "session-1", event_loop_fixture)
+            cb(None, "compaction starting")
+
+        _conn, _sid, _loop, update = mock_send.call_args.args
+        assert update._meta["hermes"]["statusKind"] == "lifecycle"
+
+    def test_kwargs_from_emit_status_do_not_leak(self, mock_conn, event_loop_fixture):
+        """``_emit_status`` calls ``status_callback(kind, message, origin=...)``; origin is Hermes'
+        own bookkeeping and must not reach the wire shape a host has to understand."""
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb = make_status_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("warn", "provider slow", origin="_emit_warning")
+
+        _conn, _sid, _loop, update = mock_send.call_args.args
+        assert update._meta == {"hermes": {"kind": "status", "statusKind": "warn", "text": "provider slow"}}

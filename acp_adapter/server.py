@@ -31,7 +31,7 @@ from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_cont
 from acp_adapter.events import (
     AssistantMessageIdAllocator, _build_plan_update_from_todo_result, _is_todo_call, _send_update,
     flush_open_tool_calls,
-    make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
+    make_message_cb, make_status_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
 )
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
@@ -231,6 +231,7 @@ class _TurnCallbacks:
     reasoning_cb: Any = None
     step_cb: Any = None
     stream_delta_cb: Any = None
+    status_cb: Any = None
     approval_cb: Any = None
     edit_approval_requester: Any = None
     streamed: bool = False
@@ -1060,6 +1061,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.message_ids = AssistantMessageIdAllocator()
             state.message_ids.close()  # new turn -> next chunk opens a fresh id
             cbs.reasoning_cb = make_thinking_cb(conn, session_id, loop, state.message_ids)
+            # Hermes' own status lines (memory recall/save, compaction, provider waits) have no ACP
+            # channel of their own; without this they reach nobody and the operator cannot see the
+            # memory system working at all (see ``make_status_cb`` for the carrier).
+            cbs.status_cb = make_status_cb(conn, session_id, loop)
             cbs.step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta, turn_state)
             message_cb = make_message_cb(conn, session_id, loop, state.message_ids)
 
@@ -1087,6 +1092,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         agent.thinking_callback = None
         agent.reasoning_callback, agent.step_callback = cbs.reasoning_cb, cbs.step_cb
         agent.stream_delta_callback = cbs.stream_delta_cb
+        # Read lazily by ``_emit_status`` at emit time, so the memory providers' own indicators
+        # (which capture ``agent._emit_status`` at init) also land here.
+        agent.status_callback = cbs.status_cb
         return cbs
 
     async def _finish_turn(

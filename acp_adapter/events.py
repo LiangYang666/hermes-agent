@@ -262,6 +262,40 @@ def _make_text_cb(
     return _cb
 
 
+def make_status_cb(conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop) -> Callable:
+    """Bridge Hermes' status lines to ACP — ``👁️ Hindsight — recalled 8 memories``, compaction
+    countdowns, provider waits: everything that already flows to the CLI and to the gateway.
+
+    WHY THIS SHAPE. ACP has no status object, and inventing a ``sessionUpdate`` type would be
+    invisible to every existing client while breaking the ones that validate the schema. ``_meta`` is
+    the extension door the protocol DOES leave open, so the carrier is an ordinary thought chunk with
+    an EMPTY text block and the sentence in ``_meta.hermes``:
+
+        {"sessionUpdate": "agent_thought_chunk",
+         "content": {"type": "text", "text": ""},
+         "_meta": {"hermes": {"kind": "status", "statusKind": "lifecycle", "text": "👁️ …"}}}
+
+    A client that does not know the extension therefore renders nothing (an empty thought), which is
+    the honest degradation — better than a fake line in the transcript that would then be persisted as
+    something the agent never said.
+
+    Status lines are EPHEMERAL: they describe what the process is doing now, so hosts are expected to
+    show the latest one for the running turn and forget it at turn-end (agentus does exactly that).
+    """
+
+    def _cb(kind: Any = "lifecycle", message: Any = "", **_kwargs: Any) -> None:
+        line = str(message or "").strip()
+        if not line:
+            return
+        update = acp.update_agent_thought_text("")
+        update._meta = {
+            "hermes": {"kind": "status", "statusKind": str(kind or "lifecycle"), "text": line},
+        }
+        _send_update(conn, session_id, loop, update)
+
+    return _cb
+
+
 def make_thinking_cb(
     conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop,
     message_ids: AssistantMessageIdAllocator | None = None,
