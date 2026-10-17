@@ -26,6 +26,16 @@ from agent.skill_utils import (
 
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_external_skill_dirs(monkeypatch):
+    """Hermetic: the env var is a RUNTIME input, so an ambient one must not leak into assertions.
+
+    An Agentus-hosted Hermes (or any launcher that sets `HERMES_EXTERNAL_SKILLS_DIRS`) would
+    otherwise make every test that asserts on the resolved dirs depend on who ran pytest.
+    """
+    monkeypatch.delenv("HERMES_EXTERNAL_SKILLS_DIRS", raising=False)
+
+
 def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
     """Repeated skill config helpers should parse config.yaml only once."""
     from agent import skill_utils
@@ -336,3 +346,78 @@ class TestBOMToleranceSiblingSites:
         assert fm is not None
         assert fm.get("name") == "bp"
 
+# ── HERMES_EXTERNAL_SKILLS_DIRS: the per-process half of external_dirs ────────────────────────
+# A host that spawns one Hermes per task (an ACP cockpit, a container, CI) has no way to add a skill
+# root except by writing into the shared HERMES_HOME. The environment is per process, so this is the
+# one channel that scopes a skill to a single run — these tests pin that contract.
+
+def _prepare_home(tmp_path, monkeypatch, config: str | None = None):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    if config is not None:
+        (hermes_home / "config.yaml").write_text(config, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_EXTERNAL_SKILLS_DIRS", raising=False)
+    skill_utils._external_dirs_cache_clear()
+    return hermes_home
+
+
+def test_env_external_skills_dirs_work_with_no_config_file(tmp_path, monkeypatch):
+    _prepare_home(tmp_path, monkeypatch)
+    extra = tmp_path / "pkg" / "skills"
+    extra.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_EXTERNAL_SKILLS_DIRS", str(extra))
+
+    assert get_external_skills_dirs() == [extra.resolve()]
+
+
+def test_env_external_skills_dirs_are_appended_after_config_dirs(tmp_path, monkeypatch):
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    _prepare_home(tmp_path, monkeypatch, f"skills:\n  external_dirs:\n    - {configured}\n")
+    from_env = tmp_path / "from-env"
+    from_env.mkdir()
+    monkeypatch.setenv("HERMES_EXTERNAL_SKILLS_DIRS", str(from_env))
+
+    # config first (its own tier order), env on top — never the other way round.
+    assert get_external_skills_dirs() == [configured.resolve(), from_env.resolve()]
+
+
+def test_env_external_skills_dirs_accepts_pathsep_lists_and_skips_junk(tmp_path, monkeypatch):
+    import os as _os
+
+    _prepare_home(tmp_path, monkeypatch)
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+    missing = tmp_path / "not-there"
+    monkeypatch.setenv(
+        "HERMES_EXTERNAL_SKILLS_DIRS",
+        _os.pathsep.join([str(first), "", str(missing), str(second), str(first)]),
+    )
+
+    # empty entries, a missing dir and a duplicate are all dropped; order is preserved.
+    assert get_external_skills_dirs() == [first.resolve(), second.resolve()]
+
+
+def test_env_external_skills_dirs_drop_the_local_profile_dir(tmp_path, monkeypatch):
+    hermes_home = _prepare_home(tmp_path, monkeypatch)
+    local = hermes_home / "skills"
+    local.mkdir()
+    monkeypatch.setenv("HERMES_EXTERNAL_SKILLS_DIRS", str(local))
+
+    # the local tier already outranks external; listing it twice would make names ambiguous.
+    assert get_external_skills_dirs() == []
+
+
+def test_env_external_skills_dirs_expand_home_and_vars(tmp_path, monkeypatch):
+    _prepare_home(tmp_path, monkeypatch)
+    extra = tmp_path / "expanded"
+    extra.mkdir()
+    monkeypatch.setenv("MY_SKILL_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_EXTERNAL_SKILLS_DIRS", "${MY_SKILL_ROOT}/expanded")
+
+    assert get_external_skills_dirs() == [extra.resolve()]
