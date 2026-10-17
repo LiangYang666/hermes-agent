@@ -26,6 +26,16 @@ from agent.skill_utils import (
 
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_external_skill_dirs(monkeypatch):
+    """Hermetic: the env var is a RUNTIME input, so an ambient one must not leak into assertions.
+
+    An Agentus-hosted Hermes (or any launcher that sets `HERMES_EXTERNAL_SKILLS_DIRS`) would
+    otherwise make every test that asserts on the resolved dirs depend on who ran pytest.
+    """
+    monkeypatch.delenv("HERMES_EXTERNAL_SKILLS_DIRS", raising=False)
+
+
 def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
     """Repeated skill config helpers should parse config.yaml only once."""
     from agent import skill_utils
