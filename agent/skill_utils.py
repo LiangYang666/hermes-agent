@@ -317,9 +317,55 @@ def _config_str_list(raw) -> list[str]:
     return [e for e in (str(entry).strip() for entry in raw) if e]
 
 
+def _env_external_skills_dirs() -> list[Path]:
+    """``HERMES_EXTERNAL_SKILLS_DIRS`` — the PER-PROCESS half of `skills.external_dirs`.
+
+    Why an env var and not another config key: config.yaml is per HOME, so a host that spawns one
+    Hermes process per task (an ACP cockpit, a container, CI) can only point at extra skill roots by
+    writing into someone else's home — the very directory every other Hermes on the machine reads.
+    The environment IS per process, so this is the only channel that scopes a skill to one run
+    without touching config: `HERMES_EXTERNAL_SKILLS_DIRS=/pkg/skills hermes acp`.
+
+    Format: ``os.pathsep``-separated, ``~``/``${VAR}`` expanded, relative entries resolved against
+    HERMES_HOME. Same tier as the config list (TIER_EXTERNAL) and the same two rules: missing dirs
+    are skipped (an uninstalled package must not break discovery) and the local profile dir is
+    dropped, because the local tier already outranks external.
+    """
+    raw = os.environ.get("HERMES_EXTERNAL_SKILLS_DIRS") or ""
+    entries = [e.strip() for e in raw.split(os.pathsep) if e.strip()]
+    if not entries:
+        return []
+    local_skills = get_skills_dir().resolve()
+    out: list[Path] = []
+    for entry in entries:
+        try:
+            p = _home_relative(_expand_path(entry)).resolve()
+        except OSError:
+            continue
+        if p == local_skills or p in out:
+            continue
+        if p.is_dir():
+            out.append(p)
+        else:
+            logger.debug("HERMES_EXTERNAL_SKILLS_DIRS entry is not a directory, skipping: %s", p)
+    return out
+
+
 def get_external_skills_dirs() -> list[Path]:
     """Validated, deduplicated ``skills.external_dirs`` (existing dirs only). Entries
-    are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is skipped."""
+    are ``~``/``${VAR}`` expanded, relative to HERMES_HOME; the local skills dir is skipped.
+    ``HERMES_EXTERNAL_SKILLS_DIRS`` is appended on top of the config list (see
+    :func:`_env_external_skills_dirs`) — it is not cached, because the environment cannot change
+    under a running process while config.yaml can."""
+    dirs = _config_external_skills_dirs()
+    for p in _env_external_skills_dirs():
+        if p not in dirs:
+            dirs.append(p)
+    return dirs
+
+
+def _config_external_skills_dirs() -> list[Path]:
+    """The ``skills.external_dirs`` half, cached by config identity (the env half is not)."""
     config_path = get_config_path()
     if not config_path.exists():
         return []
