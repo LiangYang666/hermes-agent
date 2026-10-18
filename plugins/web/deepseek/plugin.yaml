@@ -1,0 +1,7 @@
+name: web-deepseek
+version: 1.0.0
+description: "DeepSeek Search + Fetch on DeepSeek's own index (api.deepseek.com/v1/tools/*). Reuses DEEPSEEK_API_KEY; billed per successful request at ¥5 / 1,000 calls."
+author: Hermes
+kind: backend
+provides_web_providers:
+  - deepseek
