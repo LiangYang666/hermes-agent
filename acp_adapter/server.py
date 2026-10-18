@@ -27,6 +27,7 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.commands import SlashCommandsMixin, _estimate_tokens
+from acp_adapter.background import BackgroundRelay
 from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
     AssistantMessageIdAllocator, _build_plan_update_from_todo_result, _is_todo_call, _send_update,
@@ -285,6 +286,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        # Per-session background relay (issue #22): the one consumer of ``completion_queue`` on the ACP
+        # path, and the producer of the ``background`` snapshot frame. Keyed by ACP session id, which IS
+        # the gateway session key the terminal tool registers background processes under.
+        self._bg: dict[str, BackgroundRelay] = {}
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -763,6 +768,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # blocking; inline it froze the loop serving every JSON-RPC request (#58083).
         state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd)
         await self._attach_session_mcp(state, mcp_servers, "New session %s (cwd=%s)", state.session_id, cwd)
+        # A resumed/rebuilt session can still have processes from its previous life: report the state
+        # before the host draws an idle conversation (#22).
+        await self._pump_background(state, state.session_id, self._conn, completions=False)
         return NewSessionResponse(session_id=state.session_id, **await self._session_response_fields(state))
 
     async def load_session(
@@ -773,6 +781,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             logger.warning("load_session: session %s not found", session_id)
             return None
         await self._attach_session_mcp(state, mcp_servers, "Loaded session %s", session_id)
+        await self._pump_background(state, session_id, self._conn, completions=False)
         return LoadSessionResponse(**await self._session_response_fields(state, "load"))
 
     async def resume_session(
@@ -783,6 +792,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             logger.warning("resume_session: session %s not found, creating new", session_id)
             state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd)
         await self._attach_session_mcp(state, mcp_servers, "Resumed session %s", state.session_id)
+        await self._pump_background(state, state.session_id, self._conn, completions=False)
         return ResumeSessionResponse(**await self._session_response_fields(state, "resume"))
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
@@ -1097,6 +1107,54 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         agent.status_callback = cbs.status_cb
         return cbs
 
+    def _background_relay(self, session_id: str, conn: Any) -> "BackgroundRelay | None":
+        """This session's relay, bound to the CURRENT connection.
+
+        A reconnect swaps the client object, and a stale relay would keep writing frames to a socket the
+        host has forgotten — so the binding is checked, not assumed.
+        """
+        if conn is None:
+            return None
+        # `getattr`: several tests build the agent with `object.__new__` to exercise one method in
+        # isolation (test_finish_turn_finally), so `__init__` never ran and the dict is absent. The cost
+        # is one attribute lookup per turn.
+        if not hasattr(self, "_bg"):
+            self._bg = {}
+        relay = self._bg.get(session_id)
+        if relay is None or relay.conn is not conn:
+            if relay is not None:
+                relay.stop()
+            relay = BackgroundRelay(conn, session_id, asyncio.get_running_loop())
+            self._bg[session_id] = relay
+        return relay
+
+    async def _pump_background(
+        self, state: SessionState, session_id: str, conn: Any, *, completions: bool = True,
+    ) -> None:
+        """Report this session's background work to the host: completions first, then the snapshot.
+
+        Called at turn-end (the natural boundary the gateway uses), on session attach (so a resumed
+        session immediately shows processes that are still running), and then by the relay's own idle
+        tick until nothing is left. Never raises: a host that cannot render these frames must not be
+        able to break a turn.
+        """
+        relay = self._background_relay(session_id, conn)
+        if relay is None:
+            return
+        try:
+            if not completions:
+                # Attach path: report STATE only. Draining here would synthesise completions the host
+                # never had a turn for, and the agent would answer questions nobody asked.
+                tasks = await relay.flush_snapshot_only()
+                remaining = any(t.get("status") == "running" for t in tasks)
+            else:
+                remaining = await relay.flush()
+        except Exception:
+            logger.debug("Background pump failed for %s", session_id, exc_info=True)
+            return
+        if remaining:
+            relay.start(is_idle=lambda: not state.is_running and not state.command_op)
+
     async def _finish_turn(
         self, state: SessionState, session_id: str, conn: Any, result: dict, pre_turn_hermes_id: Any,
         streamed_message: bool,
@@ -1146,6 +1204,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.is_running = False
                 state.current_prompt_text = ""
             await self._drain_queued_prompts(state, session_id, conn)
+            # Turn boundary is where the gateway drains too: a background process that finished during
+            # the turn gets its wake-up now, and the host sees the row that explains it (#22). Idle
+            # afterwards is handled by the relay's own tick.
+            await self._pump_background(state, session_id, conn)
 
         usage = None
         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
