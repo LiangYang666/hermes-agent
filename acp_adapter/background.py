@@ -44,8 +44,10 @@ logger = logging.getLogger(__name__)
 TICK_SECONDS = 5.0
 
 # Truncation lives here, not in the host: a command line can be enormous, and the frame is a status
-# row, not a transcript.
-COMMAND_CHARS = 200
+# row, not a transcript. 200 was too small to answer the question the row is opened for — the operator
+# reading 「它到底在跑什么」 got a pipeline cut mid-flag. 4000 keeps the whole line for every realistic
+# one-liner (and for a `bash -c '…'` heredoc) while still bounding a pathological paste.
+COMMAND_CHARS = 4000
 COMPLETION_TEXT_CHARS = 1200
 
 
