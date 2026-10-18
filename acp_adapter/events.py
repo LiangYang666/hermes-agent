@@ -288,7 +288,13 @@ def make_status_cb(conn: acp.Client, session_id: str, loop: asyncio.AbstractEven
         if not line:
             return
         update = acp.update_agent_thought_text("")
-        update._meta = {
+        # `field_meta`, NOT `_meta`: the model's attribute is `field_meta` and `_meta` is only its
+        # ALIAS on the wire. Assigning `update._meta` creates an attribute the model does not hold, so
+        # `model_dump` drops it without a word — the frame then ships as a bare empty thought chunk and
+        # the host has no way to tell it from a status it cannot read (agentus stored 26 of those and
+        # drew 「思考 0 字」). Serialisation goes through `model_dump(by_alias=True)`, which is what puts
+        # the sentence under `_meta.hermes` on the wire.
+        update.field_meta = {
             "hermes": {"kind": "status", "statusKind": str(kind or "lifecycle"), "text": line},
         }
         _send_update(conn, session_id, loop, update)

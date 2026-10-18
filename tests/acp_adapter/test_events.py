@@ -5,6 +5,7 @@ import gc
 import uuid
 import warnings
 from concurrent.futures import Future
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -345,6 +346,16 @@ class TestToolCallsAlwaysReachATerminalStatus:
 # ---------------------------------------------------------------------------
 
 
+def _wire(update: Any) -> dict[str, Any]:
+    """What the host actually receives for this update.
+
+    Serialisation is `model_dump(by_alias=True)`, so a field is only on the wire if it is a real model
+    field; an attribute set outside the schema (`update._meta`) vanishes here while still reading back
+    fine in Python — which is why the assertions below go through this door and not the attribute.
+    """
+    return update.model_dump(by_alias=True, exclude_none=True)
+
+
 class TestMakeStatusCb:
     """`👁️ Hindsight — recalled 8 memories` has to travel as an honest ACP frame.
 
@@ -363,7 +374,10 @@ class TestMakeStatusCb:
         assert session_id == "session-1"
         assert update.sessionUpdate == "agent_thought_chunk"
         assert update.content.text == ""  # nothing is added to the conversation
-        assert update._meta == {
+        # Assert on the WIRE, not on the attribute: `_meta` is only the alias of `field_meta`, so
+        # reading back `update._meta` proves nothing about what a host actually receives. This is the
+        # assertion that would have caught the status line never shipping (2026-10-17).
+        assert _wire(update)["_meta"] == {
             "hermes": {
                 "kind": "status",
                 "statusKind": "lifecycle",
@@ -387,7 +401,7 @@ class TestMakeStatusCb:
             cb(None, "compaction starting")
 
         _conn, _sid, _loop, update = mock_send.call_args.args
-        assert update._meta["hermes"]["statusKind"] == "lifecycle"
+        assert _wire(update)["_meta"]["hermes"]["statusKind"] == "lifecycle"
 
     def test_kwargs_from_emit_status_do_not_leak(self, mock_conn, event_loop_fixture):
         """``_emit_status`` calls ``status_callback(kind, message, origin=...)``; origin is Hermes'
@@ -397,4 +411,4 @@ class TestMakeStatusCb:
             cb("warn", "provider slow", origin="_emit_warning")
 
         _conn, _sid, _loop, update = mock_send.call_args.args
-        assert update._meta == {"hermes": {"kind": "status", "statusKind": "warn", "text": "provider slow"}}
+        assert _wire(update)["_meta"] == {"hermes": {"kind": "status", "statusKind": "warn", "text": "provider slow"}}
