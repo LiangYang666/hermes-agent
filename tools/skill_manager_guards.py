@@ -74,14 +74,20 @@ def _reset_background_review_read_marks() -> None:
 
 
 def _resolved_roots(skill_path: Path):
-    """``(resolved skill_path, [(root, resolved_root), ...])`` over every resolvable skills root."""
-    from agent.skill_utils import get_all_skills_dirs
+    """``(resolved skill_path, [(root, resolved_root), ...])`` over every resolvable skills root.
+
+    Trusted project roots are included: `skill_manage` may now edit a repo's own skills (that is
+    the point of a versioned playbook), so a path inside one must pass the containment checks that
+    guard deletes and writes. Untrusted repos stay out — trust is the gate for writing too, so the
+    agent cannot edit a checkout nobody approved.
+    """
+    from agent.skill_utils import get_all_skills_dirs, get_project_skills_dirs
     try:
         resolved = skill_path.resolve()
     except OSError:
         resolved = skill_path
     roots = []
-    for root in get_all_skills_dirs():
+    for root in [*get_project_skills_dirs(), *get_all_skills_dirs()]:
         with suppress(OSError):
             roots.append((root, root.resolve()))
     return resolved, roots

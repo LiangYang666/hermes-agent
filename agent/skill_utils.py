@@ -637,6 +637,128 @@ def get_untrusted_project_skills_root() -> Optional[tuple[Path, int]]:
     return (root, count) if count else None
 
 
+def project_skills_state(root: Path) -> tuple[bool, int]:
+    """``(trusted, skill_count)`` for *root* — the pair every surface must report identically.
+
+    Deliberately root-explicit: a multi-session host (ACP) resolves the project from the SESSION's
+    cwd, not from the process cwd, so this takes the root instead of re-deriving it from a
+    thread-local that the caller may not have set yet.
+    """
+    count = 0
+    for d in _candidate_project_skills_dirs(root):
+        try:
+            count += sum(1 for _ in iter_skill_index_files(d, "SKILL.md"))
+        except OSError:
+            continue
+    return (is_project_root_trusted(root), count)
+
+
+def _project_root_key(p) -> str:
+    try:
+        return str(Path(p).expanduser().resolve())
+    except OSError:
+        return str(p)
+
+
+def _write_skills_config(mutate: "Callable[[dict], bool]") -> bool:
+    """Load config.yaml, let *mutate* edit its ``skills:`` mapping, save when it changed.
+
+    Deferred CLI import (this module is intentionally import-light): the writer must be the CLI's
+    own loader/writer — it owns the backup + atomic replace — so `hermes skills trust` and the ACP
+    trust option cannot disagree about what lands on disk.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    config = load_config()
+    skills_cfg = config.get("skills")
+    if not isinstance(skills_cfg, dict):
+        skills_cfg = {}
+        config["skills"] = skills_cfg
+    if not mutate(skills_cfg):
+        return False
+    save_config(config)
+    return True
+
+
+def set_project_root_trust(root: Path, trusted: bool) -> bool:
+    """Add/remove *root* in ``skills.trusted_project_dirs``. True when config.yaml changed.
+
+    Trusting also clears an earlier "leave it off" decision: the two lists are opposite answers to
+    the same question, and a root holding both would make the prompt and the loader disagree.
+    """
+    key = _project_root_key(root)
+
+    def _mutate(skills_cfg: dict) -> bool:
+        entries = skills_cfg.get("trusted_project_dirs") or []
+        if not isinstance(entries, list):
+            entries = [entries]
+        keys = [_project_root_key(e) for e in entries]
+        ignored = skills_cfg.get("project_skills_ignored") or []
+        if not isinstance(ignored, list):
+            ignored = [ignored]
+        ignored_keys = [_project_root_key(e) for e in ignored]
+        changed = False
+        if trusted:
+            if key not in keys:
+                keys.append(key)
+                skills_cfg["trusted_project_dirs"] = keys
+                changed = True
+            if key in ignored_keys:
+                skills_cfg["project_skills_ignored"] = [
+                    e for e, k in zip(ignored, ignored_keys) if k != key]
+                changed = True
+        else:
+            if key in keys:
+                skills_cfg["trusted_project_dirs"] = [
+                    e for e, k in zip(entries, keys) if k != key]
+                changed = True
+        return changed
+
+    return _write_skills_config(_mutate)
+
+
+def is_project_root_ignored(root: Path) -> bool:
+    """True when the operator already answered "not now" for this repo root."""
+    entries = _skills_cfg_get("project_skills_ignored") or []
+    if not isinstance(entries, list):
+        entries = [entries]
+    key = _project_root_key(root)
+    return any(_project_root_key(e) == key for e in entries)
+
+
+def set_project_root_ignored(root: Path, ignored: bool) -> bool:
+    """Record/clear a lasting "not now" for *root* (and untrust it when set)."""
+    key = _project_root_key(root)
+
+    def _mutate(skills_cfg: dict) -> bool:
+        entries = skills_cfg.get("project_skills_ignored") or []
+        if not isinstance(entries, list):
+            entries = [entries]
+        keys = [_project_root_key(e) for e in entries]
+        changed = False
+        if ignored:
+            if key not in keys:
+                entries.append(key)
+                skills_cfg["project_skills_ignored"] = entries
+                changed = True
+            trusted = skills_cfg.get("trusted_project_dirs") or []
+            if not isinstance(trusted, list):
+                trusted = [trusted]
+            kept = [e for e in trusted if _project_root_key(e) != key]
+            if len(kept) != len(trusted):
+                skills_cfg["trusted_project_dirs"] = kept
+                changed = True
+        else:
+            if key in keys:
+                skills_cfg["project_skills_ignored"] = [
+                    e for e, k in zip(entries, keys) if k != key]
+                changed = True
+        return changed
+
+    return _write_skills_config(_mutate)
+
+
+
 # Scan-time injection defense: trust is a repo-level decision made once, but a
 # `git pull` could inject a malicious skill into an already-trusted repo. Every
 # project SKILL.md is scanned with the hub's skills_guard scanner (content-hash
