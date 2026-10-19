@@ -817,7 +817,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 )
         self._schedule_available_commands_update(state.session_id)
         self._schedule_soon(lambda: self._send_usage_update(state))
-        await self._notify_project_skills(state)
+        # AFTER the response, not inside it: the notice is a session/update, and a host that is still
+        # awaiting `session/new` has not installed its session yet — a frame sent one turn earlier
+        # lands on a session id it does not know and is dropped (measured: the row rendered, the
+        # sentence never arrived).
+        self._schedule_soon(lambda: self._notify_project_skills(state))
         return {
             "models": self._build_model_state(state),
             "modes": self._session_modes(state),
