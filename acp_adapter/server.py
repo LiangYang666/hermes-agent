@@ -12,6 +12,7 @@ import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Deque, Optional
 
 import acp
@@ -263,6 +264,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     # is the protocol's reserved slot for implementation-specific option kinds.
     _CONTEXT_BUDGET_CATEGORY = "_context_window"
     _CONTEXT_BUDGET_MIN_TOKENS = 16_384
+    # Project-local skills (`<repo>/.agents/skills`, `.hermes/skills`): the trust decision used to
+    # have ONE outlet — the interactive CLI banner, which told you to run `hermes skills trust`.
+    # Every non-interactive surface (this adapter, gateway, desktop) silently skipped untrusted
+    # project skills, so a cockpit showing a playbook-bearing workspace looked like the skills were
+    # active when none were loaded. This option is the setter (same config write as the CLI, same
+    # backup/atomic path); `_notify_project_skills` is the notice. The option is only advertised
+    # when the repo actually ships project skills, so an ordinary checkout gets no extra row.
+    _PROJECT_SKILLS_CONFIG_ID = "project_skills"
+    _PROJECT_SKILLS_CATEGORY = "_project_skills"
     # ACP display labels for ladder levels (the CLI /reasoning picker's equivalents).
     _EFFORT_LABELS = {"none": "Off", "minimal": "Minimal", "low": "Low", "medium": "Medium",
                       "high": "High", "xhigh": "Extra high", "max": "Max", "ultra": "Ultra"}
@@ -408,7 +418,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # cockpit offer a free-form input without the list lying about what is set.
             budget_options.append(SessionConfigSelectOption(
                 value=current_budget, name=f"{current_budget} (custom)"))
-        return [SessionConfigOptionSelect(
+        options = [SessionConfigOptionSelect(
             id=self._REASONING_EFFORT_CONFIG_ID,
             name="Thinking depth",
             description="How much the model reasons before answering (session-scoped).",
@@ -443,6 +453,62 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         "model's own.",
             },
         )]
+        # Third row only when this repo actually carries project skills (a plain checkout gets no
+        # dead option). Selection semantics live in `set_config_option`.
+        project_option = self._project_skills_option(state)
+        if project_option is not None:
+            options.append(project_option)
+        return options
+
+    def _project_skills_option(self, state: SessionState) -> "Any | None":
+        """The trust row for the repo this SESSION runs in, or None when it has no project skills.
+
+        Resolved from ``state.cwd`` explicitly: `find_project_root()` without a start reads the
+        context-local session cwd, which is only pinned inside the per-turn/MCP threads — on this
+        loop the process cwd would answer for a different workspace.
+        """
+        from agent.skill_utils import (
+            find_project_root, is_project_root_ignored, project_skills_state)
+
+        root = find_project_root(Path(state.cwd) if state.cwd else None)
+        if root is None:
+            return None
+        trusted, count = project_skills_state(root)
+        if not count:
+            return None
+        if trusted:
+            current = "trusted"
+            description = f"{count} skill(s) from this repo are loaded."
+        elif is_project_root_ignored(root):
+            current = "ignore"
+            description = f"{count} skill(s) in this repo stay off (you chose 'never ask')."
+        else:
+            current = "ask"
+            description = (
+                f"{count} skill(s) in this repo are NOT loaded. A project skill is instructions "
+                "the agent will follow, so enabling one is a security decision — trust is per "
+                "repo root and persists (skills.trusted_project_dirs)."
+            )
+        return SessionConfigOptionSelect(
+            id=self._PROJECT_SKILLS_CONFIG_ID,
+            name="Project skills",
+            description=description,
+            type="select",
+            current_value=current,
+            options=[
+                SessionConfigSelectOption(value="ask", name="Ask me (not loaded)"),
+                SessionConfigSelectOption(value="trusted", name=f"Trust this repo ({count} skills)"),
+                SessionConfigSelectOption(value="ignore", name="Never ask for this repo"),
+            ],
+            category=self._PROJECT_SKILLS_CATEGORY,
+            field_meta={
+                "root": str(root),
+                "skillCount": count,
+                "scope": "repo",
+                "note": "Same decision as `hermes skills trust <root>`: written to config.yaml "
+                        "and applied to the next turn of every session in this repo.",
+            },
+        )
 
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
         """Authenticated providers + models, from the shared Hermes inventory (same substrate
@@ -751,12 +817,56 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 )
         self._schedule_available_commands_update(state.session_id)
         self._schedule_soon(lambda: self._send_usage_update(state))
+        # AFTER the response, not inside it: the notice is a session/update, and a host that is still
+        # awaiting `session/new` has not installed its session yet — a frame sent one turn earlier
+        # lands on a session id it does not know and is dropped (measured: the row rendered, the
+        # sentence never arrived).
+        self._schedule_soon(lambda: self._notify_project_skills(state))
         return {
             "models": self._build_model_state(state),
             "modes": self._session_modes(state),
             "config_options": self._build_config_options(state),
             "field_meta": self._provenance_meta(state.session_id, getattr(state.agent, "session_id", state.session_id)),
         }
+
+    async def _notify_project_skills(self, state: SessionState) -> None:
+        """Tell the client, once per session, that this repo ships skills it is NOT loading.
+
+        The CLI banner has said this forever; on every non-interactive surface the skills were
+        skipped with no trace at all, so a cockpit could show a playbook-bearing workspace while
+        the agent saw none of it. Carrier is the protocol's own extension door — an ordinary
+        thought chunk with an EMPTY text and the sentence in ``_meta.hermes`` (same shape as the
+        status line and the background frames): clients that don't know it render nothing, clients
+        that do show a one-line notice. No new `sessionUpdate` type — that would be invisible to
+        every existing client and break the ones validating the schema.
+        """
+        try:
+            from agent.skill_utils import (
+                find_project_root, is_project_root_ignored, project_skills_state)
+
+            root = find_project_root(Path(state.cwd) if state.cwd else None)
+            if root is None:
+                return
+            trusted, count = project_skills_state(root)
+            if trusted or not count or is_project_root_ignored(root):
+                return
+            update = acp.update_agent_thought_text("")
+            # ``field_meta`` (the model field), not ``_meta`` (its wire alias): assigning the alias
+            # hangs an attribute the model does not hold and model_dump drops it silently.
+            update.field_meta = {
+                "hermes": {
+                    "kind": "project_skills",
+                    "state": "untrusted",
+                    "root": str(root),
+                    "skillCount": count,
+                    "text": f"这个仓库有 {count} 个项目 skill 未启用（{root.name}）",
+                }
+            }
+            await self._send(state.session_id, update,
+                             fail_msg="Could not send ACP project-skills notice for %s",
+                             level=logging.DEBUG)
+        except Exception:
+            logger.debug("project skills notice failed", exc_info=True)
 
     async def _attach_session_mcp(self, state: SessionState, mcp_servers: list | None, log: str, *log_args) -> None:
         await self._register_session_mcp_servers(state, mcp_servers)
@@ -1346,6 +1456,39 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             for sibling in siblings:
                 sibling.context_budget = tokens
                 apply_context_budget(sibling.agent, tokens)
+        elif str(config_id) == self._PROJECT_SKILLS_CONFIG_ID:
+            from acp.exceptions import RequestError
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+            from agent.skill_utils import (
+                find_project_root, project_skills_state, set_project_root_ignored,
+                set_project_root_trust)
+
+            root = find_project_root(Path(state.cwd) if state.cwd else None)
+            if root is None:
+                raise RequestError.invalid_params(
+                    {"details": "this session's working directory is not inside a git checkout, "
+                                "so it has no project skills to trust"})
+            pick = str(value or "").strip().lower()
+            if pick not in {"ask", "trusted", "ignore"}:
+                raise RequestError.invalid_params(
+                    {"details": f"unknown project_skills value {value!r}; "
+                                f"use ask / trusted / ignore"})
+            was_trusted, _count = project_skills_state(root)
+            if pick == "trusted":
+                set_project_root_trust(root, True)
+            elif pick == "ignore":
+                set_project_root_ignored(root, True)
+            else:
+                # `ask` = back to "not decided yet": untrust AND drop an earlier "never ask", or
+                # the two answers would disagree and the notice would stay suppressed.
+                set_project_root_trust(root, False)
+                set_project_root_ignored(root, False)
+            if was_trusted != (pick == "trusted"):
+                # The skills section is rebuilt per turn; dropping the cached prompt is what makes
+                # the NEXT turn see the answer (the same call skill_manage and /skills reload use).
+                clear_skills_system_prompt_cache(clear_snapshot=True)
+            logger.info("Session %s: project skills for %s -> %s (config changed=%s)",
+                        session_id, root, pick, was_trusted != (pick == "trusted"))
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):

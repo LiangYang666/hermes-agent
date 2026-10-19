@@ -194,8 +194,9 @@ def _cmd_skills_trust(args):
         PROJECT_SKILLS_SUBDIRS,
         _candidate_project_skills_dirs,
         find_project_root,
-        iter_skill_index_files)
-    from hermes_cli.config import load_config, save_config
+        is_project_root_trusted,
+        iter_skill_index_files,
+        set_project_root_trust)
     action = args.skills_action
     raw_path = getattr(args, "path", None)
     if raw_path:
@@ -211,34 +212,20 @@ def _cmd_skills_trust(args):
                 "pass the project root path explicitly.")
             return
 
-    config = load_config()
-    skills_cfg = config.setdefault("skills", {})
-    trusted = skills_cfg.get("trusted_project_dirs") or []
-    if not isinstance(trusted, list):
-        trusted = [trusted]
-    trusted = [str(t) for t in trusted]
-    root_str = str(root)
-
-    def _same(t: str) -> bool:
-        return str(Path(t).expanduser().resolve()) == root_str
-
+    # ONE writer for this decision: the ACP adapter's `project_skills` config option calls the
+    # same helper, so `hermes skills trust` and a cockpit click can never disagree on disk.
     if action == "untrust":
-        kept = [t for t in trusted if not _same(t)]
-        if len(kept) == len(trusted):
+        if not set_project_root_trust(root, False):
             print(f"{root} was not trusted.")
             return
-        skills_cfg["trusted_project_dirs"] = kept
-        save_config(config)
         print(f"Untrusted: {root}")
         print("Project skills from this repo will no longer load.")
         return
 
-    if any(_same(t) for t in trusted):
+    if is_project_root_trusted(root):
         print(f"Already trusted: {root}")
     else:
-        trusted.append(root_str)
-        skills_cfg["trusted_project_dirs"] = trusted
-        save_config(config)
+        set_project_root_trust(root, True)
         print(f"Trusted: {root}")
 
     # Show what this unlocks

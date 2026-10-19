@@ -238,11 +238,17 @@ def _read_frontmatter_name(skill_md: Path) -> Optional[str]:
 
 
 def _find_skill(name: str) -> Optional[dict[str, Any]]:
-    """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
+    """Find a skill (trusted project roots, then local skills dir, then ``skills.external_dirs``).
+
+    Trusted project roots are searched FIRST because a project skill shadows the profile's copy of
+    the same name — the loader reads the project tier at higher precedence, so writing to the local
+    copy would edit a skill the agent never sees. They are also the only project tier that is
+    reachable at all: an untrusted repo is not a write target (trust is the gate, exactly as it is
+    for reading).
 
     Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
     categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
-    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs).
+    categorized form matches RELATIVE to each skill root — the one the skill lives in.
 
     As a last resort the frontmatter ``name:`` is matched too, so the name ``skills list``
     and the dashboard display (frontmatter name wins over the directory name there)
@@ -253,28 +259,29 @@ def _find_skill(name: str) -> Optional[dict[str, Any]]:
     skill's directory. A display name held by two or more distinct skills resolves to
     nothing: like skill_view's same-tier collision refusal, refusing to guess beats
     silently mutating the wrong skill; the directory name still resolves."""
-    from agent.skill_utils import get_all_skills_dirs
-    local_root = None
-    if "/" in name or "\\" in name:
-        try:
-            local_root = _skills_dir().resolve()
-        except OSError:
-            logger.debug(
-                "skills dir resolve failed; categorized lookups fall back to the unresolved path",
-                exc_info=True)
-            local_root = _skills_dir()
+    from agent.skill_utils import get_all_skills_dirs, get_project_skills_dirs
+
+    roots: list[Path] = []
+    for d in [*get_project_skills_dirs(), *get_all_skills_dirs()]:
+        if d not in roots:
+            roots.append(d)
+    categorized = "/" in name or "\\" in name
     display_matches: list[Path] = []
     seen_display: set = set()
-    for skills_dir in get_all_skills_dirs():
+    for skills_dir in roots:
         if not skills_dir.exists():
             continue
+        try:
+            root_resolved = skills_dir.resolve()
+        except OSError:
+            root_resolved = skills_dir
         for skill_dir in _iter_skill_dirs(skills_dir):
             if skill_dir.name == name:
                 return {"path": skill_dir}
-            if local_root is not None:
+            if categorized:
                 resolved = skill_dir.resolve()
-                if (resolved.is_relative_to(local_root)
-                        and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
+                if (resolved.is_relative_to(root_resolved)
+                        and resolved.relative_to(root_resolved).as_posix() == name):  # POSIX form
                     return {"path": skill_dir}
             if _read_frontmatter_name(skill_dir / "SKILL.md") == name:
                 key = skill_dir / "SKILL.md"
