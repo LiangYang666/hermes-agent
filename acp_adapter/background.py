@@ -16,7 +16,7 @@ the door ``make_status_cb`` already proved: an ordinary ``agent_thought_chunk`` 
 payload in ``_meta.hermes``::
 
     {"kind": "completion", "text": "…", "exitCode": 1, "processId": "…"}
-    {"kind": "background", "tasks": [{"id", "command", "pid", "status", "uptimeSeconds", "exitCode"}]}
+    {"kind": "background", "tasks": [{"id", "command", "pid", "status", "uptimeSeconds", "exitCode", "notifyOnComplete"}]}
 
 A host that does not know a kind renders nothing (an empty thought), which is the honest degradation;
 a host that knows ``completion`` can synthesise the same follow-up prompt the gateway would have
@@ -138,6 +138,12 @@ class BackgroundRelay:
                 "pid": row.get("pid"),
                 "status": status,
                 "uptimeSeconds": int(row.get("uptime_seconds") or 0),
+                # Does this process OWE the session a wake-up? `notify_on_complete` is the whole
+                # difference between 「agent 已经收工，这个进程自己跑完就完事」 and 「agent 还在
+                # 等这次唤醒才能继续」 — the host has no way to tell them apart from id/status
+                # alone, and the two want different rendering (issue #35). Additive: a host that
+                # does not know the field ignores it.
+                "notifyOnComplete": bool(row.get("notify_on_complete")),
             }
             if status == "running":
                 # Remember it so its exit is reported even when it was never tagged notify_on_complete.

@@ -98,6 +98,28 @@ def test_snapshot_is_emitted_once_per_change(monkeypatch):
     assert len([p for p in _payloads(conn) if p["kind"] == "background"]) == 1
 
 
+def test_snapshot_carries_the_wake_up_flag(monkeypatch):
+    """#35: the host needs to know which rows OWE the session a wake-up.
+
+    `notify_on_complete` is the difference between 「agent 已经收工」 and 「agent 还在等这次唤醒」.
+    `list_sessions()` only includes the key when it is true, so a plain spawn must serialise as
+    ``False`` rather than vanishing — a host filtering on the field must not have to guess.
+    """
+    conn = FakeConn()
+    registry = FakeRegistry(rows=[
+        {"session_id": "wake", "command": "make test", "pid": 11, "status": "running",
+         "uptime_seconds": 1, "notify_on_complete": True},
+        {"session_id": "quiet", "command": "tail -f x", "pid": 12, "status": "running",
+         "uptime_seconds": 1},
+    ])
+    relay = _relay(monkeypatch, conn, registry)
+    assert asyncio.run(relay.flush()) is True
+
+    tasks = [p for p in _payloads(conn) if p["kind"] == "background"][0]["tasks"]
+    flags = {t["id"]: t["notifyOnComplete"] for t in tasks}
+    assert flags == {"wake": True, "quiet": False}
+
+
 def test_silent_exit_is_reported_once_then_dropped(monkeypatch):
     """A process without notify_on_complete publishes no event — the snapshot is the only witness."""
     conn = FakeConn()
