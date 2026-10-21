@@ -4,8 +4,10 @@ Safe printing, quiet-mode gating, deduped context-overflow warnings, and the buf
 chatter that is shown only when every retry/fallback is exhausted.
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
+import inspect
 import logging
 import sys
+from typing import Optional
 
 from agent.i18n import t
 from agent.session_activity import ActivityProvenance
@@ -62,16 +64,30 @@ class StatusOutputMixin:
             return False
         return self.quiet_mode and not self.tool_progress_callback and getattr(self, "platform", "") == "cli"
 
-    def _call_callback(self, name: str, *args, origin: str) -> None:
-        """Invoke ``self.<name>(*args)`` if set, swallowing errors — a driver callback must never break the loop."""
+    def _call_callback(self, name: str, *args, origin: str, extra: Optional[dict] = None) -> None:
+        """Invoke ``self.<name>(*args)`` if set, swallowing errors — a driver callback must never break the loop.
+
+        ``extra`` carries structured detail beside the sentence (the recall items behind
+        「recalled 8 memories」). It is dropped, not fatal, for a callback whose signature has no room
+        for it: gateway/CLI drivers take ``(kind, message)`` and must keep working."""
         cb = getattr(self, name, None)
         if cb:
             try:
-                cb(*args)
+                kwargs = extra or {}
+                if kwargs:
+                    try:
+                        params = inspect.signature(cb).parameters
+                    except (TypeError, ValueError):
+                        params = None
+                    if params is not None and not any(
+                        p.kind is p.VAR_KEYWORD for p in params.values()
+                    ) and not all(k in params for k in kwargs):
+                        kwargs = {}
+                cb(*args, **kwargs)
             except Exception:
                 logger.debug("%s error in %s", name, origin, exc_info=True)
 
-    def _emit_status_kind(self, kind: str, message: str, *, origin: str) -> None:
+    def _emit_status_kind(self, kind: str, message: str, *, origin: str, extra: Optional[dict] = None) -> None:
         """Print to the CLI (``_vprint(force=True)``) and forward to ``status_callback(kind, message)``. Never raises."""
         from gateway.warning_notifications import is_warning_status
         try:
@@ -79,7 +95,7 @@ class StatusOutputMixin:
                 self._vprint(f"{self.log_prefix}{message}", force=True)
         except Exception:
             pass
-        self._call_callback("status_callback", kind, message, origin=origin)
+        self._call_callback("status_callback", kind, message, origin=origin, extra=extra)
 
     def _warning_presentation_enabled(self) -> bool:
         from gateway.warning_notifications import warning_notifications_enabled
@@ -97,9 +113,11 @@ class StatusOutputMixin:
         from gateway.warning_notifications import DiagnosticText
         self._emit_status(DiagnosticText(message))
 
-    def _emit_status(self, message: str) -> None:
-        """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
-        self._emit_status_kind("lifecycle", message, origin="_emit_status")
+    def _emit_status(self, message: str, *, extra: Optional[dict] = None) -> None:
+        """Emit a lifecycle status message (CLI + gateway ``status_callback``).
+
+        ``extra`` is machine-readable detail a host may render (see ``_call_callback``)."""
+        self._emit_status_kind("lifecycle", message, origin="_emit_status", extra=extra)
 
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning for degraded side paths where the turn continues but the user must know."""

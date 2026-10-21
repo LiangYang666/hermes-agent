@@ -403,6 +403,35 @@ class TestMakeStatusCb:
         _conn, _sid, _loop, update = mock_send.call_args.args
         assert _wire(update)["_meta"]["hermes"]["statusKind"] == "lifecycle"
 
+    def test_recall_items_ride_the_same_carrier(self, mock_conn, event_loop_fixture):
+        """The items behind 「recalled 8 memories」 are `_meta.hermes.items` — same frame, same
+        degradation: a client that never heard of the key draws the line exactly as before."""
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb = make_status_cb(mock_conn, "session-1", event_loop_fixture)
+            cb(
+                "lifecycle",
+                "👁️ Hindsight — recalled 2 memories",
+                extra={"items": [{"text": "prefers oolong"}, {"text": "works on agentus", "tags": ["work"]}],
+                       "truncated": True},
+            )
+
+        _conn, _sid, _loop, update = mock_send.call_args.args
+        hermes = _wire(update)["_meta"]["hermes"]
+        assert hermes["text"] == "👁️ Hindsight — recalled 2 memories"
+        assert hermes["items"] == [{"text": "prefers oolong"}, {"text": "works on agentus", "tags": ["work"]}]
+        assert hermes["truncated"] is True
+
+    def test_empty_items_add_no_keys(self, mock_conn, event_loop_fixture):
+        """Count-only provider → byte-identical frame to before this change."""
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb = make_status_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("lifecycle", "👁️ Hindsight — recalled 2 memories", extra={"items": [], "truncated": False})
+
+        _conn, _sid, _loop, update = mock_send.call_args.args
+        assert _wire(update)["_meta"] == {
+            "hermes": {"kind": "status", "statusKind": "lifecycle", "text": "👁️ Hindsight — recalled 2 memories"}
+        }
+
     def test_kwargs_from_emit_status_do_not_leak(self, mock_conn, event_loop_fixture):
         """``_emit_status`` calls ``status_callback(kind, message, origin=...)``; origin is Hermes'
         own bookkeeping and must not reach the wire shape a host has to understand."""

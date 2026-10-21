@@ -294,9 +294,15 @@ def make_status_cb(conn: acp.Client, session_id: str, loop: asyncio.AbstractEven
         # the host has no way to tell it from a status it cannot read (agentus stored 26 of those and
         # drew 「思考 0 字」). Serialisation goes through `model_dump(by_alias=True)`, which is what puts
         # the sentence under `_meta.hermes` on the wire.
-        update.field_meta = {
-            "hermes": {"kind": "status", "statusKind": str(kind or "lifecycle"), "text": line},
-        }
+        hermes: dict = {"kind": "status", "statusKind": str(kind or "lifecycle"), "text": line}
+        # Structured detail beside the sentence, when the emitter has any (the recall items behind
+        # 「recalled 8 memories」). Same carrier, same rules: a client that does not know the keys
+        # renders exactly what it rendered before.
+        detail = _kwargs.get("extra")
+        if isinstance(detail, dict) and detail.get("items"):
+            hermes["items"] = detail["items"]
+            hermes["truncated"] = bool(detail.get("truncated"))
+        update.field_meta = {"hermes": hermes}
         _send_update(conn, session_id, loop, update)
 
     return _cb

@@ -925,9 +925,12 @@ def _memory_turn_start_and_prefetch(
     # drop injected memory.
     if ext_prefetch_cache:
         with suppress(Exception):
-            _recall_indicator = agent._memory_manager.describe_recall()
+            _recall_indicator, _recall_items, _recall_truncated = agent._memory_manager.recall_payload()
             if _recall_indicator:
-                agent._emit_status(_recall_indicator)
+                agent._emit_status(
+                    _recall_indicator,
+                    extra={"items": _recall_items, "truncated": _recall_truncated} if _recall_items else None,
+                )
     return ext_prefetch_cache
 
 
