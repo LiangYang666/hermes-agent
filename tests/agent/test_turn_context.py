@@ -384,19 +384,42 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
 
 
 def test_recall_indicator_emitted_when_memory_injected():
-    """When prefetch injects memory, the deterministic indicator is emitted."""
+    """When prefetch injects memory, the deterministic indicator is emitted — with its items."""
     agent = _FakeAgent()
     agent._emit_status = MagicMock()
     mm = MagicMock()
     mm.prefetch_all.return_value = "- recalled fact"
-    mm.describe_recall.return_value = "👁️ Hindsight — recalled 2 memories"
+    mm.recall_payload.return_value = (
+        "👁️ Hindsight — recalled 2 memories",
+        [{"text": "prefers oolong"}, {"text": "works on agentus"}],
+        False,
+    )
     agent._memory_manager = mm
 
     # A substantive query — a trivial prompt ("hi", "hello") skips prefetch_all
     # entirely, so there'd be nothing to indicate. See is_trivial_prompt.
     _build(agent, user_message="what did we decide about the deploy pipeline?")
 
-    agent._emit_status.assert_any_call("👁️ Hindsight — recalled 2 memories")
+    # The sentence reaches the user; the items ride beside it so a host can expand the count.
+    agent._emit_status.assert_any_call(
+        "👁️ Hindsight — recalled 2 memories",
+        extra={"items": [{"text": "prefers oolong"}, {"text": "works on agentus"}], "truncated": False},
+    )
+
+
+def test_recall_indicator_without_items_keeps_the_old_call_shape():
+    """A provider that only reports a count must emit exactly what it emitted before (no empty
+    ``extra``), so count-only providers and their hosts stay byte-identical."""
+    agent = _FakeAgent()
+    agent._emit_status = MagicMock()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "- recalled fact"
+    mm.recall_payload.return_value = ("👁️ Hindsight — recalled 2 memories", [], False)
+    agent._memory_manager = mm
+
+    _build(agent, user_message="what did we decide about the deploy pipeline?")
+
+    agent._emit_status.assert_any_call("👁️ Hindsight — recalled 2 memories", extra=None)
 
 
 def test_recall_indicator_skipped_when_nothing_injected():
@@ -411,7 +434,7 @@ def test_recall_indicator_skipped_when_nothing_injected():
     # indicator path must stay silent (as opposed to being skipped as trivial).
     _build(agent, user_message="what did we decide about the deploy pipeline?")
 
-    mm.describe_recall.assert_not_called()
+    mm.recall_payload.assert_not_called()
     for call in agent._emit_status.call_args_list:
         assert "👁️" not in str(call)
 

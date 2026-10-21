@@ -568,7 +568,17 @@ class MemoryManager:
     def describe_recall(self) -> str:
         """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.
         Call right after :meth:`prefetch_all` so the user SEES memory was used even if the model is silent."""
+        return self.recall_payload()[0]
+
+    def recall_payload(self) -> tuple[str, list[dict[str, Any]], bool]:
+        """The indicator line PLUS the items behind it: ``(line, items, truncated)``.
+
+        The line alone says "recalled 3 memories" — true, unfalsifiable, and useless when the recall
+        was stale or about the wrong person. The items are what a UI can expand. Providers that only
+        implement the count contribute nothing here, so this degrades to the old behaviour."""
         segments: list[str] = []
+        items: list[dict[str, Any]] = []
+        truncated = False
         for status in self._each_provider("recall_status failed (non-fatal)", lambda p: p.recall_status()):
             if status is None:
                 continue
@@ -576,7 +586,11 @@ class MemoryManager:
             detail = ("recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
                       if status.count > 1 else "recalled relevant memory")
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
-        return "  ".join(segments)
+            for item in (getattr(status, "items", None) or []):
+                if isinstance(item, dict) and item.get("text"):
+                    items.append(item)
+            truncated = truncated or bool(getattr(status, "truncated", False))
+        return "  ".join(segments), items, truncated
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""

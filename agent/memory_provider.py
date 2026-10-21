@@ -53,11 +53,20 @@ def is_core_memory_provider(name: Optional[str]) -> bool:
 class RecallStatus:
     """What the last prefetch injected, for the deterministic recall indicator
     (``MemoryManager.describe_recall``). ``count == 0`` means content without a
-    discrete count (e.g. a synthesized reflect answer) and renders generically."""
+    discrete count (e.g. a synthesized reflect answer) and renders generically.
+
+    ``items`` is the detail behind the count — ``[{"text": ..., "tags"?: [...], "type"?: str}]``,
+    already capped by the provider (a status frame is not a data channel: one item per ~200 chars,
+    a few KB per turn). ``truncated`` says the cap actually bit, so a host can show "and N more"
+    instead of pretending the bank had nothing else. Providers on older hosts simply do not set
+    them; a host that does not know the fields ignores them.
+    """
 
     provider_label: str
     count: int
     glyph: str = INDICATOR_GLYPH
+    items: Optional[list[dict[str, Any]]] = None
+    truncated: bool = False
 
 
 # Prompts with no semantic signal; single source of truth for the core prefetch gate and

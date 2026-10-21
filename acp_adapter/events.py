@@ -294,9 +294,22 @@ def make_status_cb(conn: acp.Client, session_id: str, loop: asyncio.AbstractEven
         # the host has no way to tell it from a status it cannot read (agentus stored 26 of those and
         # drew 「思考 0 字」). Serialisation goes through `model_dump(by_alias=True)`, which is what puts
         # the sentence under `_meta.hermes` on the wire.
-        update.field_meta = {
-            "hermes": {"kind": "status", "statusKind": str(kind or "lifecycle"), "text": line},
-        }
+        hermes: dict = {"kind": "status", "statusKind": str(kind or "lifecycle"), "text": line}
+        # Structured detail beside the sentence, when the emitter has any (the recall items behind
+        # 「recalled 8 memories」). Same carrier, same rules: a client that does not know the keys
+        # renders exactly what it rendered before.
+        # `_call_callback` **spreads** the detail into kwargs (`cb(kind, message, **extra)`),
+        # so in production there is no `extra=` key at all — only the unit test built one that
+        # way. Measured 2026-10-21: the fork shipped items, the plugin shipped items, and every
+        # live status frame still carried none, because this line looked for the wrong envelope.
+        # Accept both: the envelope, and the spread fields.
+        detail = _kwargs.get("extra")
+        if not isinstance(detail, dict):
+            detail = _kwargs
+        if isinstance(detail, dict) and detail.get("items"):
+            hermes["items"] = detail["items"]
+            hermes["truncated"] = bool(detail.get("truncated"))
+        update.field_meta = {"hermes": hermes}
         _send_update(conn, session_id, loop, update)
 
     return _cb
