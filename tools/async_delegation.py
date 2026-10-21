@@ -696,6 +696,34 @@ def has_live_for_session(session_key: str = "", origin_ui_session_id: str = "", 
     return bool(_session_records(_LIVE_STATES, session_key, origin_ui_session_id, parent_session_id))
 
 
+def live_delegations_for_session(
+    session_key: str = "", origin_ui_session_id: str = "", parent_session_id: str = "",
+) -> list[dict[str, Any]]:
+    """The live delegations themselves, shaped for an observer frame.
+
+    ``has_live_for_session`` answers 「还有没有」; a host that draws a row needs 「是哪几个、在干什么、
+    跑了多久」. Kept here rather than in the caller so the routing selectors stay in one place — an
+    ACP relay that re-derived ownership from ``session_key`` alone would silently lose delegations
+    dispatched from a TUI tab or a rotated gateway session.
+    """
+    now = time.time()
+    out: list[dict[str, Any]] = []
+    for rec in _session_records(_LIVE_STATES, session_key, origin_ui_session_id, parent_session_id):
+        goals = rec.get("goals") if rec.get("is_batch") and isinstance(rec.get("goals"), (list, tuple)) else []
+        dispatched = float(rec.get("dispatched_at") or 0)
+        out.append({
+            "delegation_id": str(rec.get("delegation_id") or ""),
+            "goal": str(rec.get("goal") or ""),
+            "goals": [str(g) for g in goals],
+            "is_batch": bool(rec.get("is_batch")),
+            "task_count": len(goals) or 1,
+            "status": str(rec.get("status") or ""),
+            "dispatched_at": dispatched,
+            "uptime_seconds": int(max(0.0, now - dispatched)) if dispatched else 0,
+        })
+    return out
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
