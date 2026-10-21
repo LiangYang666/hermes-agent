@@ -163,7 +163,48 @@ class BackgroundRelay:
         for sid in list(self._seen_running):
             if not any(r.get("id") == sid for r in out):
                 self._seen_running.pop(sid, None)
+        # Subagents are the OTHER producer on this queue (issue #39). They never appear in
+        # `list_sessions` — `delegate_task(background=true)` runs in-process — so a snapshot built
+        # from the registry alone said 「没有后台任务」 while two children were reading files for eight
+        # minutes, and `flush()`'s 「还有活的吗」 answered False on the first idle tick, which is what
+        # killed the consumer before the completion ever arrived. Rows AND the verdict come from the
+        # delegation ledger, so the host draws them and the relay keeps ticking until they finish.
+        out.extend(self._delegation_rows())
         return out
+
+    def _delegation_rows(self) -> list[dict[str, Any]]:
+        """Live delegations, shaped like a task row so a host needs no second renderer.
+
+        ``kind`` is additive: a host that predates it sees a row whose ``command`` is the goal and
+        whose ``pid`` is null — legible, if plainer than it could be.
+        """
+        try:
+            from tools.async_delegation import live_delegations_for_session
+            live = live_delegations_for_session(session_key=self.session_id)
+        except Exception:
+            logger.debug("Could not list delegations for %s", self.session_id, exc_info=True)
+            return []
+        rows: list[dict[str, Any]] = []
+        for row in live:
+            goal = str(row.get("goal") or "")
+            if not goal:
+                goals = row.get("goals") or []
+                goal = str(goals[0]) if goals else ""
+            rows.append({
+                "id": str(row.get("delegation_id") or ""),
+                "kind": "delegation",
+                # `command` carries the goal so an unaware host still shows something true.
+                "command": goal[:COMMAND_CHARS],
+                "pid": None,
+                # Every state in the ledger's live set means 「still owes this session a wake-up」,
+                # which is exactly what the registry calls `running`.
+                "status": "running",
+                "phase": str(row.get("status") or ""),
+                "uptimeSeconds": int(row.get("uptime_seconds") or 0),
+                "notifyOnComplete": True,
+                "taskCount": int(row.get("task_count") or 1),
+            })
+        return rows
 
     # ---- pump --------------------------------------------------------------------------------
     async def flush_snapshot_only(self) -> list[dict[str, Any]]:
