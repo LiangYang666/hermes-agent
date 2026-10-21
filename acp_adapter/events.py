@@ -298,7 +298,14 @@ def make_status_cb(conn: acp.Client, session_id: str, loop: asyncio.AbstractEven
         # Structured detail beside the sentence, when the emitter has any (the recall items behind
         # 「recalled 8 memories」). Same carrier, same rules: a client that does not know the keys
         # renders exactly what it rendered before.
+        # `_call_callback` **spreads** the detail into kwargs (`cb(kind, message, **extra)`),
+        # so in production there is no `extra=` key at all — only the unit test built one that
+        # way. Measured 2026-10-21: the fork shipped items, the plugin shipped items, and every
+        # live status frame still carried none, because this line looked for the wrong envelope.
+        # Accept both: the envelope, and the spread fields.
         detail = _kwargs.get("extra")
+        if not isinstance(detail, dict):
+            detail = _kwargs
         if isinstance(detail, dict) and detail.get("items"):
             hermes["items"] = detail["items"]
             hermes["truncated"] = bool(detail.get("truncated"))

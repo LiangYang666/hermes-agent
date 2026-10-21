@@ -432,6 +432,21 @@ class TestMakeStatusCb:
             "hermes": {"kind": "status", "statusKind": "lifecycle", "text": "👁️ Hindsight — recalled 2 memories"}
         }
 
+    def test_recall_items_survive_the_real_callback_shape(self, mock_conn, event_loop_fixture):
+        """Production does not pass `extra=` at all: `status_output._call_callback` spreads the
+        detail dict into keyword args. The envelope tests above stayed green while every live
+        frame shipped without items — this one pins the shape the driver actually uses."""
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb = make_status_cb(mock_conn, "session-1", event_loop_fixture)
+            cb("lifecycle", "👁️ Hindsight — recalled 1 memory",
+               items=[{"text": "prefers oolong"}], truncated=False, origin="_emit_status")
+
+        _conn, _sid, _loop, update = mock_send.call_args.args
+        hermes = _wire(update)["_meta"]["hermes"]
+        assert hermes["items"] == [{"text": "prefers oolong"}]
+        assert hermes["truncated"] is False
+        assert "origin" not in hermes
+
     def test_kwargs_from_emit_status_do_not_leak(self, mock_conn, event_loop_fixture):
         """``_emit_status`` calls ``status_callback(kind, message, origin=...)``; origin is Hermes'
         own bookkeeping and must not reach the wire shape a host has to understand."""
