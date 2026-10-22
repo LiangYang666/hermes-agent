@@ -63,19 +63,48 @@ class _BenignProbeMethodFilter(logging.Filter):
 
 
 def _setup_logging() -> None:
-    """Route all logging to stderr so stdout stays clean for ACP stdio."""
+    """Route console logging to stderr so stdout stays clean for ACP stdio, and write the files.
+
+    This entry point is the only launch mode that never joined ``hermes_logging``: gateway, the
+    CLI and the TUI all call ``setup_logging()``, but the ACP adapter installed a stderr-only root
+    handler and stopped there. Cockpit sessions therefore left nothing in
+    ``~/.hermes/logs/agent.log`` — a turn that failed inside the agent was invisible from the log
+    side (the cockpit server keeps only an in-memory stderr ring for crash text), so "context
+    compaction kept timing out" had no trace of which route was tried or when it failed (#45).
+
+    ``setup_logging()`` adds FILE handlers only — ``agent.log``/``errors.log`` and, by ``mode``,
+    ``gateway.log``/``gui.log`` — so the stdout reservation for ACP JSON-RPC is untouched, and
+    the multi-process append + rename rotation it already relies on covers one more writer.
+    """
     from agent.redact import RedactingFormatter
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(RedactingFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                                             datefmt="%Y-%m-%d %H:%M:%S"))
     handler.addFilter(_BenignProbeMethodFilter())
+    # Tag it so a second call replaces ITS OWN stderr handler without touching anyone else's.
+    handler._hermes_acp_stderr = True  # type: ignore[attr-defined]
     root = logging.getLogger()
-    root.handlers.clear()
+    # Remove only the handler a PREVIOUS call of ours installed. Never clear the whole list:
+    # ``hermes acp`` runs inside the CLI, whose import-time ``setup_logging(mode="cli")`` already put
+    # the file-logging QueueHandler on root, and ``setup_logging()`` only attaches that handler on its
+    # FIRST call (``_register_queued_handler``) — clearing root here would leave the process with no
+    # file logging at all, and the later ``setup_logging(mode="acp")`` cannot put it back.
+    for existing in list(root.handlers):
+        if getattr(existing, "_hermes_acp_stderr", False):
+            root.removeHandler(existing)
     root.addHandler(handler)
     root.setLevel(logging.INFO)
     for noisy in ("httpx", "httpcore", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # After the stderr handler is in place: `setup_logging` only appends file handlers, so this
+    # order keeps the console stream single and stderr-only. Never fatal — an unwritable log
+    # directory must not stop an agent from serving a session.
+    try:
+        from hermes_logging import setup_logging
+        setup_logging(mode="acp")
+    except Exception:
+        logging.getLogger(__name__).warning("File logging unavailable for hermes-acp", exc_info=True)
 
 
 def _load_env() -> None:
