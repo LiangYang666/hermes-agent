@@ -82,13 +82,17 @@ class BackgroundRelay:
         self._task: asyncio.Task | None = None
 
     # ---- wire -------------------------------------------------------------------------------
-    async def _send(self, payload: dict[str, Any]) -> None:
-        """One frame, awaited rather than fire-and-forget.
+    async def _send(self, payload: dict[str, Any]) -> bool:
+        """One frame, awaited rather than fire-and-forget. True when the host accepted it.
 
         ``events._send_update`` exists for callbacks that run on WORKER threads; here every caller is
         already on the loop (turn-end, session attach, the idle tick), and scheduling a coroutine onto the
         loop we are standing on would block ``future.result(timeout=5)`` for five seconds and then drop the
         frame. So the update is awaited directly.
+
+        The caller NEEDS the boolean: a delegation result is a durable row, and acknowledging it after a
+        frame that never reached anybody would turn "wakes twice" into "lost forever" (a reconnect
+        installs a new client object and frames written to the old socket reach nobody — see __init__).
         """
         update = acp.update_agent_thought_text("")
         # ``field_meta``, not ``_meta``: `_meta` is only the wire ALIAS of the model field, so assigning
@@ -97,8 +101,43 @@ class BackgroundRelay:
         update.field_meta = {"hermes": payload}
         try:
             await self.conn.session_update(session_id=self.session_id, update=update)
+            return True
         except Exception:
             logger.debug("Could not send background frame for %s", self.session_id, exc_info=True)
+            return False
+
+    @staticmethod
+    def _settle_delegation(raw: dict[str, Any]) -> None:
+        """Acknowledge a subagent batch — only once its frame has actually landed.
+
+        ``restore_completions()`` re-offers every durable row still marked ``pending`` on the next
+        drain, so a batch that is never acknowledged wakes the session again on every idle window (one
+        「子代理回来了」turn per /stop, forever). Settling belongs HERE and not in the registry's
+        ``drain_notifications``: the CLI/TUI consumers deliver the same row through their own
+        claim→complete handshake, and a row settled during the drain would leave them nothing to claim —
+        i.e. the result would be dropped instead of replayed.
+
+        An interim per-task notice shares the batch id but is not the result; acknowledging it would
+        settle the final row before it exists.
+        """
+        if raw.get("type") != "async_delegation":
+            return
+        try:
+            from tools.async_delegation import is_interim_delegation_event, mark_completion_delivered
+        except Exception:
+            logger.debug("async delegation helpers unavailable; leaving the row pending", exc_info=True)
+            return
+        try:
+            if is_interim_delegation_event(raw):
+                return
+            delegation_id = str(raw.get("delegation_id") or "")
+            if delegation_id:
+                mark_completion_delivered(delegation_id)
+        except Exception:
+            logger.warning(
+                "Could not settle async delegation %s after delivering it",
+                raw.get("delegation_id"), exc_info=True,
+            )
 
     # ---- registry ----------------------------------------------------------------------------
     @staticmethod
@@ -230,13 +269,17 @@ class BackgroundRelay:
         ended as still running.
         """
         for raw, formatted in self._drain():
-            await self._send({
+            sent = await self._send({
                 "kind": "completion",
                 "text": _summary_text(raw, formatted),
                 "exitCode": raw.get("exit_code"),
                 "processId": raw.get("session_id"),
                 "command": str(raw.get("command") or "")[:COMMAND_CHARS],
             })
+            # Only after the host accepted the frame: settling early would make an unreachable socket
+            # drop the result for good instead of re-offering it on the next tick.
+            if sent:
+                self._settle_delegation(raw)
         tasks = self._rows()
         blob = json.dumps(tasks, sort_keys=True, ensure_ascii=False)
         self.last_tasks = tasks

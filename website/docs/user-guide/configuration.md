@@ -1016,6 +1016,8 @@ auxiliary:
     base_url: null                                  # Custom OpenAI-compatible endpoint (overrides provider)
 ```
 
+`auxiliary.compression.reasoning_effort` decides whether the summarizer thinks before it writes. Compaction is dominated by that one call — with a hybrid reasoning model, thinking can burn 1–2k reasoning tokens before the first summary word, which measured 44s vs 16–19s and ~+49% output tokens with no better summary. Set it to `none` for summaries (the per-task knob, documented under [auxiliary task blocks](#auxiliary-models); unset = the provider's own default, so nothing changes unless you ask). The disable goes through the normal provider projection and 400-retry ladder, so a route that cannot turn thinking off lands on its lowest effort instead of failing.
+
 :::info Legacy config migration
 Older configs with `compression.summary_model`, `compression.summary_provider`, and `compression.summary_base_url` are automatically migrated to `auxiliary.compression.*` on first load (config version 17). No manual action needed.
 :::
