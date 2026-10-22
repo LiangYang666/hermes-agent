@@ -1633,7 +1633,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         Suppressed only when ALL of these hold, so nothing the agent does NOT know about goes quiet:
           · the kill that COMPLETED was issued by the process's owner (`termination_caller`) — or, when
             the reader thread finalised first, an intent of the owner's that is followed by a
-            signal-shaped exit (negative code / 137 / 143) which is not older than the intent;
+            signal-shaped exit (-15 / -9) which is not older than the intent;
           · the receipt says `killed`, or says `exited` on such a signal death;
           · `backend_lost`, `failed_start`, supervisor shutdowns, kills issued by ANOTHER session, and
             any process that simply finished on its own keep waking — the agent cannot know those.
@@ -1645,7 +1645,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         if not owner:
             return False
         who = (session.termination_caller or "").strip()
-        signal_death = (session.exit_code or 0) in (-15, -9, 137, 143)
+        # Only the codes WE send as a negative number. 137/143 are shell-style codes: the system (OOM)
+        # or an unrelated signal can produce them, and a death we cannot attribute must wake.
+        signal_death = (session.exit_code or 0) in (-15, -9)
         if who and who != owner:
             # A kill by another task COMPLETED: authoritative, and it is news to this owner — never
             # let a stale intent of ours mute it (review B2).
@@ -2245,11 +2247,21 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
             # above already handled the main process; this catches stragglers.
             scope_stopped = self._stop_scope(session)
+            finalizing = self._reader_finalizing(session)
+            if finalizing and by_owner:
+                # Our own kill arrived while the reader was still draining a death it finalised.
+                # Give it a bounded moment so the snapshot below is the whole output — otherwise the
+                # wake is suppressed AND the agent's kill result is missing the tail (review r2 B-m2).
+                finalizing = self._await_reader_drain(session)
             with session._lock:
                 result = self._exit_snapshot(session, "already_exited")
-                finalizing = self._reader_finalizing(session)
             if not scope_stopped:
                 result["scope_stop_failed"] = session.systemd_unit
+            if by_owner:
+                # The owner asked for this kill and now holds the output: whatever the reader
+                # publishes is not news. Clearing the intent is safe because `consume_output`
+                # already marked the result consumed for every consumer.
+                self._clear_kill_intent(session)
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
             if consume_output and not finalizing:
@@ -2304,37 +2316,41 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # closes the delayed-notification race without losing the transcript.
             with session._lock:
                 output = _completion_output(session)
+                # Did the READER already write a receipt for a different death? The child can exit on
+                # its own inside the SIGKILL grace window (0 for a clean finish, 137 from the OOM
+                # killer). Snapshot before stamping, or the guard below proves itself true against a
+                # value we just wrote (review round 2, B-M1).
+                reader_reason = session.completion_reason
+                reader_exit_code = session.exit_code
+                reader_exited = session.exited
+                ours = self._kill_claims_this_death(reader_exited, reader_reason, reader_exit_code)
                 if consume_output:
                     self._completion_consumed.add(session_id)
                 session.exited = True
-                session.exit_code = -15  # SIGTERM
-                session.completion_reason = "killed"
-                session.termination_source = source
-                # WHO asked (issue #49): a kill the OWNER issued is a decision the agent already has,
-                # so its completion must not wake the agent that made it. See _publish_finished.
-                session.termination_caller = caller_task_id
+                if ours:
+                    session.exit_code = -15  # SIGTERM
+                    session.completion_reason = "killed"
+                    session.termination_source = source
+                    # WHO asked (issue #49): a kill the OWNER issued is a decision the agent already
+                    # has, so its completion must not wake the agent that made it. See _publish_finished.
+                    session.termination_caller = caller_task_id
                 session.kill_intent_caller = ""
                 session.kill_intent_at = 0.0
             # The reader thread can finalise the session while the signal path
             # blocks in the SIGKILL grace window: its ``save_completed_result``
             # then persists this kill as a plain ``exited``. Re-write the receipt
             # so the durable record matches what the caller was told.
-            if not self._move_to_finished(session):
-                # The reader thread finished it first. Rewrite the receipt ONLY when the death really
-                # looks like our signal: a child that exited 0 on its own before the signal landed is
-                # NOT a kill, and stamping -15 on it would replace the truth (exit code, real output)
-                # with a plausible lie the agent can never correct (review M1).
-                reader_receipt_signal = (session.exit_code or 0) in (-15, -9, 137, 143)
-                if reader_receipt_signal:
-                    with session._lock:
-                        session.exit_code = -15
-                        session.completion_reason = "killed"
-                        session.termination_source = source
-                        if caller_task_id:
-                            session.termination_caller = caller_task_id
-                        session.kill_intent_caller = ""
-                        session.kill_intent_at = 0.0
-                    save_completed_result(session)
+            if not self._move_to_finished(session) and ours:
+                # The reader thread finished it first. Rewrite the receipt so the DURABLE record says
+                # what the caller was told — but only when the death really was our signal: a child
+                # that exited 0 / 137 on its own keeps its code and reason (review M1, B-M1).
+                with session._lock:
+                    session.exit_code = -15
+                    session.completion_reason = "killed"
+                    session.termination_source = source
+                    if caller_task_id:
+                        session.termination_caller = caller_task_id
+                save_completed_result(session)
             self._write_checkpoint()
             return {
                 # "killed" only when the receipt really says killed; a child that beat us to its own
@@ -2345,6 +2361,35 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         except Exception as e:
             self._clear_kill_intent(session)
             return {"status": "error", "error": str(e)}
+
+    @staticmethod
+    def _kill_claims_this_death(reader_exited: bool, reader_reason: str, reader_exit_code) -> bool:
+        """May the kill path stamp ITS receipt over what is already there? (review round 2, B-M1)
+
+        Only when no receipt exists yet, or the one the reader wrote is itself a kill, or the code is
+        a signal WE send (-15 SIGTERM / -9 SIGKILL, as Python reports a negative code). A child that
+        finished on its own (0), or that the SYSTEM killed (137 = 128+9, the OOM killer), keeps its
+        own record — anything else would replace the truth the agent needs to read.
+        """
+        return (
+            not reader_exited
+            or reader_reason == "killed"
+            or (reader_exit_code or 0) in (-15, -9)
+        )
+
+    @staticmethod
+    def _await_reader_drain(session: ProcessSession, timeout: float = 2.0) -> bool:
+        """Wait (bounded) for the reader thread to finish draining an already-exited process.
+
+        Returns True when it is STILL finalising after the timeout — the caller then knows the
+        snapshot it is about to take may be short.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not ProcessRegistry._reader_finalizing(session):
+                return False
+            time.sleep(0.01)
+        return ProcessRegistry._reader_finalizing(session)
 
     @staticmethod
     def _clear_kill_intent(session: ProcessSession) -> None:
