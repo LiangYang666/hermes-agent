@@ -115,7 +115,7 @@ def test_backend_lost_still_wakes_even_for_the_owner():
         registry._running[session.id] = session
         with session._lock:
             session.mark_exited(-9, "lost", "backend_lost")
-        session.kill_requested_by_owner = True   # the owner did ask… but the backend died, not the kill
+        session.kill_intent_caller = "owner-1"   # the owner did ask… but the backend died, not the kill
         registry._move_to_finished(session)
         deadline = time.monotonic() + 10
         while not _notices_for(session.id) and time.monotonic() < deadline:
@@ -211,3 +211,48 @@ def test_owner_kill_on_an_already_exited_child_is_silent_when_it_was_our_signal(
             session.mark_exited(-15, "exited")   # reader-authored receipt for our SIGTERM
         registry._move_to_finished(session)
         assert _notices_for(session.id) == [], "our own SIGTERM, finalised by the reader: stay silent"
+
+
+def test_owner_stamp_on_a_clean_exit_is_not_a_kill():
+    """B-M1 (round 2): `termination_caller` being ours does not make exit 0 our kill."""
+    with _clean_registry() as registry:
+        session = _decided_session(
+            registry, termination_caller="owner-1", termination_source="process.kill", exit_code=0,
+        )
+        with session._lock:
+            session.mark_exited(0, "exited")
+        registry._move_to_finished(session)
+        assert len(_notices_for(session.id)) == 1, "a clean exit keeps its own status and still wakes"
+
+
+def test_receipts_written_by_an_older_build_still_load(tmp_path, monkeypatch):
+    """B-m1 (round 2): a new field in _RESULT_FIELDS used to hide every older receipt."""
+    import json
+    import os
+
+    import tools.process_registry_results as results
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_ID", "owner-1")
+    directory = tmp_path / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    old_style = {
+        "id": "proc_old", "command": "cmd", "cwd": "/tmp", "task_id": "t", "owner_task_id": "owner-1",
+        "session_key": "", "parent_session_id": "owner-1", "started_at": 1.0, "exit_code": 0,
+        "completion_reason": "exited", "termination_source": "", "notify_on_complete": False,
+        "output": "done",
+    }  # note: no `termination_caller` — written before that field existed
+    (directory / "proc_old.json").write_text(json.dumps(old_style), encoding="utf-8")
+    loaded = results.load_completed_results("proc_")
+    assert "proc_old" in loaded, f"an old-style receipt must still load, got {list(loaded)}"
+    assert os.path.exists(directory / "proc_old.json")
+
+
+def test_kill_receipt_only_overwrites_deaths_it_caused():
+    """B-M1 (round 2), decision level: the commit block used to stamp -15/killed over ANY receipt."""
+    owns = ProcessRegistry._kill_claims_this_death
+    assert owns(False, "", None) is True, "nothing written yet: the kill writes the receipt"
+    assert owns(True, "killed", -15) is True, "a kill receipt is ours"
+    assert owns(True, "exited", -15) is True, "our SIGTERM, finalised by the reader first"
+    assert owns(True, "exited", 0) is False, "clean exit on its own: keep 0/exited"
+    assert owns(True, "exited", 137) is False, "OOM kill (128+9): the system's record, not ours"
