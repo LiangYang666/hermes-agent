@@ -1419,12 +1419,45 @@ class TestKillProcess:
             with host_guard, term_patch, saver:
                 result = registry.kill_process(s.id)
 
+            # The reader observed a clean exit (0) before our SIGTERM could be attributed: that is a
+            # child which finished on its own, and both the result and the durable receipt must say so
+            # rather than claiming a kill nobody can verify (issue #49 review, M1/B-M1).
+            assert result["status"] == "exited"
+            assert result["completion_reason"] == "exited"
+            assert saved[0] == ("exited", "", 0)
+            assert saved[-1] == ("exited", "", 0), "a clean exit must not be rewritten as a kill"
+        finally:
+            registry._running.pop(s.id, None)
+            registry._finished.pop(s.id, None)
+
+    def test_kill_receipt_rewritten_when_the_reader_saw_our_signal(self, registry):
+        """The other half of the race: the reader finalises a SIGNAL death - that one is ours."""
+        s = _make_session(sid="proc_kill_race_signal", command="sleep 999")
+        s.pid = 424244
+        s.detached = True
+        registry._running[s.id] = s
+
+        def reader_wins_with_sigterm(pid, start=None):
+            registry._finish_exited(s, -15)
+
+        saved = []
+
+        def record_save(session):
+            saved.append((session.completion_reason, session.termination_source, session.exit_code))
+
+        try:
+            host_guard = patch.object(ProcessRegistry, "_host_pid_is_ours", return_value=True)
+            term_patch = patch.object(
+                ProcessRegistry, "_terminate_host_pid", side_effect=reader_wins_with_sigterm,
+            )
+            saver = patch("tools.process_registry.save_completed_result", side_effect=record_save)
+            with host_guard, term_patch, saver:
+                result = registry.kill_process(s.id)
+
             assert result["status"] == "killed"
             assert result["completion_reason"] == "killed"
             assert result["termination_source"] == "process.kill"
-            # First save: the reader won the race and persisted a plain exit.
-            assert saved[0] == ("exited", "", 0)
-            # Second save: the receipt rewritten with the kill outcome.
+            assert saved[0] == ("exited", "", -15)
             assert saved[-1] == ("killed", "process.kill", -15)
         finally:
             registry._running.pop(s.id, None)
