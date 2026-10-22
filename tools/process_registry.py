@@ -557,6 +557,8 @@ class ProcessSession:
     exit_code: Optional[int] = None             # None while running
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    termination_caller: str = ""                # task id that issued the kill ("" = not a tool kill)
+    kill_requested_by_owner: bool = False        # the owner itself asked for this kill (issue #49)
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # Recovered from checkpoint (no pipe)
@@ -1616,9 +1618,39 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 session._completion_event.set()
         return was_running
 
+    @staticmethod
+    def _kill_is_the_owners_own_decision(session: ProcessSession) -> bool:
+        """Was this exit a kill the process's OWNER asked for? (issue #49)
+
+        A kill is synchronous and deliberate: the agent has the outcome, and often the reason, the
+        moment it asks for it. Waking it up to announce that result interrupts whatever it moved on
+        to — in one publish investigation three bounded retry loops it had killed itself came back as
+        three separate turns.
+
+        Suppressed only when ALL of these hold, so nothing the agent does NOT know about goes quiet:
+          · the owner itself issued the kill (recorded as INTENT before signalling, so the reader
+            thread winning the finalize race does not make the death look spontaneous);
+          · the exit is a kill from the tool surface, or the plain `exited` receipt that race produces;
+          · `backend_lost`, `failed_start`, supervisor shutdowns and kills issued by ANOTHER session
+            keep waking — in those cases the agent cannot know the job died.
+
+        The result itself is untouched: ``poll`` / ``read_log`` still report ``killed`` and the
+        output. Only the wake is dropped.
+        """
+        if not session.kill_requested_by_owner:
+            return False
+        if session.completion_reason == "killed":
+            return session.termination_source in ("process.kill", "kill_all")
+        # The reader thread wrote the receipt first (the kill's grace window): still our kill.
+        return session.completion_reason == "exited"
+
     def _publish_finished(self, session: ProcessSession, was_running: bool) -> None:
         self._release_finished_handles(session)
         self._write_checkpoint()
+        if was_running and session.notify_on_complete and self._kill_is_the_owners_own_decision(session):
+            logger.info("Completion notice suppressed for %s: killed by its own owner (%s)",
+                        session.id, session.termination_caller or "?")
+            return
         if was_running and session.notify_on_complete:
             notification = {
                 "type": "completion",
@@ -2161,6 +2193,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
 
     def kill_process(
         self, session_id: str, *, source: str = "process.kill", consume_output: bool = True,
+        caller_task_id: str = "",
     ) -> dict:
         """Kill a background process and return its output snapshot.
         ``consume_output`` is true for explicit tool/RPC kills (the caller sees the
@@ -2190,8 +2223,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             if consume_output and not finalizing:
                 self._completion_consumed.add(session_id)
             return result
+        # Record the INTENT before signalling (issue #49): the child can exit and be finalised by the
+        # reader thread inside the SIGKILL grace window, and then the receipt says a plain `exited`
+        # while the truth is "the owner killed it". The flag survives that race; the receipt does not.
+        if caller_task_id:
+            owner = (session.owner_task_id or session.task_id or "").strip()
+            if owner and caller_task_id.strip() == owner:
+                session.kill_requested_by_owner = True
         try:
-            early = self._signal_kill(session, session_id, consume_output)
+            early = self._signal_kill(session, session_id, consume_output, caller_task_id)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
@@ -2242,11 +2282,23 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
+                # WHO asked (issue #49): a kill the OWNER issued is a decision the agent already has,
+                # so its completion must not wake the agent that made it. See _publish_finished.
+                session.termination_caller = caller_task_id
             # The reader thread can finalise the session while the signal path
             # blocks in the SIGKILL grace window: its ``save_completed_result``
             # then persists this kill as a plain ``exited``. Re-write the receipt
             # so the durable record matches what the caller was told.
             if not self._move_to_finished(session):
+                # The reader thread finished it first: the DURABLE receipt is rewritten below, and the
+                # in-memory one must say the same thing — `poll` after a kill has to report the kill,
+                # not the "exited" the reader happened to catch (issue #49 asserts this).
+                with session._lock:
+                    session.exit_code = -15
+                    session.completion_reason = "killed"
+                    session.termination_source = source
+                    if caller_task_id:
+                        session.termination_caller = caller_task_id
                 save_completed_result(session)
             self._write_checkpoint()
             return {
@@ -2265,7 +2317,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         session._scope_stop_pending = not stopped
         return stopped
 
-    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
+    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool,
+                     caller_task_id: str = "") -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
         PID. Returns a final result dict when the kill cannot proceed (recycled/dead
         recovered PID, or no runtime handle), else None."""
@@ -2710,14 +2763,17 @@ def _list_processes(task_id) -> dict:
 
 # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
 # actions are redacted; stdin actions return only status.
+# action -> (handler(session_id, args, caller_task_id) -> dict, redact output?). The caller is the
+# task id of the agent that issued the action: `kill` needs it to tell "I decided this" from "somebody
+# else did" (issue #49), and the other actions ignore it.
 _SESSION_ACTIONS = {
-    "poll": (lambda sid, a: process_registry.poll(sid), True),
-    "log": (lambda sid, a: process_registry.read_log(sid, offset=a.get("offset"), limit=a.get("limit", 200)), True),
-    "wait": (lambda sid, a: process_registry.wait(sid, timeout=a.get("timeout")), True),
-    "kill": (lambda sid, a: process_registry.kill_process(sid), True),
-    "write": (lambda sid, a: process_registry.write_stdin(sid, str(a.get("data", ""))), False),
-    "submit": (lambda sid, a: process_registry.submit_stdin(sid, str(a.get("data", ""))), False),
-    "close": (lambda sid, a: process_registry.close_stdin(sid), False),
+    "poll": (lambda sid, a, caller: process_registry.poll(sid), True),
+    "log": (lambda sid, a, caller: process_registry.read_log(sid, offset=a.get("offset"), limit=a.get("limit", 200)), True),
+    "wait": (lambda sid, a, caller: process_registry.wait(sid, timeout=a.get("timeout")), True),
+    "kill": (lambda sid, a, caller: process_registry.kill_process(sid, caller_task_id=caller), True),
+    "write": (lambda sid, a, caller: process_registry.write_stdin(sid, str(a.get("data", ""))), False),
+    "submit": (lambda sid, a, caller: process_registry.submit_stdin(sid, str(a.get("data", ""))), False),
+    "close": (lambda sid, a, caller: process_registry.close_stdin(sid), False),
 }
 
 
@@ -2776,7 +2832,7 @@ def _handle_process(args, **kw):
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         handler, redact = _SESSION_ACTIONS[action]
-        result = handler(session_id, args)
+        result = handler(session_id, args, str(kw.get("task_id") or ""))
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
 
