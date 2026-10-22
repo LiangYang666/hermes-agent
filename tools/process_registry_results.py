@@ -108,7 +108,10 @@ def load_completed_results(prefix: str = "") -> dict:
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue
             session = ProcessSession(
-                **{key: record[key] for key in _RESULT_FIELDS},
+                # `.get`: a receipt written by an older build lacks fields added since (it used to
+                # raise KeyError and the whole record was silently skipped, so upgrading hid the
+                # retained results) — review round 2, B-m1.
+                **{key: record.get(key, "") for key in _RESULT_FIELDS},
                 exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()
