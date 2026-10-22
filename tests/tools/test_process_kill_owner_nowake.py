@@ -148,3 +148,66 @@ def test_tool_surface_passes_the_caller_through():
         time.sleep(0.2)
         assert _notices_for(session.id) == []
         assert json.loads(json.dumps(registry.poll(session.id)))["status"] in ("killed", "exited")
+
+
+# --------------------------------------------------------------------------------------------------
+# Review round 1 (changes-requested): a sticky boolean could not tell "the kill I asked for" from
+# "the exit that happened anyway". These four cases pin the corrected semantics. They drive the
+# DECISION directly (no child, no reader thread) so they are deterministic.
+# --------------------------------------------------------------------------------------------------
+
+def _decided_session(registry: ProcessRegistry, *, owner="owner-1", **fields) -> ProcessSession:
+    session = ProcessSession(
+        id=f"proc_decided_{time.monotonic_ns()}", command="cmd", task_id="task",
+        owner_task_id=owner, started_at=time.time(), notify_on_complete=True,
+    )
+    registry._running[session.id] = session
+    for key, value in fields.items():
+        setattr(session, key, value)
+    return session
+
+
+def test_failed_kill_does_not_silence_the_later_natural_exit():
+    """B1: a kill that reported "still running" must not mute the exit that follows it."""
+    with _clean_registry() as registry:
+        session = _decided_session(registry, kill_intent_caller="", kill_intent_at=0.0)
+        with session._lock:
+            session.mark_exited(0, "exited")
+        registry._move_to_finished(session)
+        assert len(_notices_for(session.id)) == 1, "a natural exit after a failed kill must still wake"
+
+
+def test_kill_from_another_task_after_an_owner_attempt_still_wakes():
+    """B2: the gate must follow who COMPLETED the kill, not who once asked for one."""
+    with _clean_registry() as registry:
+        session = _decided_session(
+            registry,
+            # the owner asked earlier and its kill failed; a different task then killed it
+            kill_intent_caller="owner-1", kill_intent_at=time.time() - 5,
+            termination_caller="someone-else", termination_source="process.kill",
+            exit_code=-15,
+        )
+        with session._lock:
+            session.mark_exited(-15, "killed", "process.kill")
+        registry._move_to_finished(session)
+        assert len(_notices_for(session.id)) == 1, "another session's kill is news to the owner"
+
+
+def test_owner_kill_intent_does_not_swallow_a_clean_exit():
+    """M1: the child exited 0 on its own before our signal landed — that is not a kill."""
+    with _clean_registry() as registry:
+        session = _decided_session(registry, kill_intent_caller="owner-1", kill_intent_at=time.time() - 1)
+        with session._lock:
+            session.mark_exited(0, "exited")
+        registry._move_to_finished(session)
+        assert len(_notices_for(session.id)) == 1, "exit 0 must be reported with its real status"
+
+
+def test_owner_kill_on_an_already_exited_child_is_silent_when_it_was_our_signal():
+    """M2: the wake path that actually fires for a self-kill is `already_exited` + reader draining."""
+    with _clean_registry() as registry:
+        session = _decided_session(registry, kill_intent_caller="owner-1", kill_intent_at=time.time() - 1)
+        with session._lock:
+            session.mark_exited(-15, "exited")   # reader-authored receipt for our SIGTERM
+        registry._move_to_finished(session)
+        assert _notices_for(session.id) == [], "our own SIGTERM, finalised by the reader: stay silent"
