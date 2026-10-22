@@ -1645,8 +1645,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         if not owner:
             return False
         who = (session.termination_caller or "").strip()
-        # Only the codes WE send as a negative number. 137/143 are shell-style codes: the system (OOM)
-        # or an unrelated signal can produce them, and a death we cannot attribute must wake.
+        # Only the codes WE send as a negative number. 137/143 are shell-style codes (128+N) that a
+        # wrapper shell reports: they can mean our own SIGKILL, the OOM killer, or anything else, so a
+        # death we cannot attribute must wake the agent — one extra notice beats a lost one.
         signal_death = (session.exit_code or 0) in (-15, -9)
         if who and who != owner:
             # A kill by another task COMPLETED: authoritative, and it is news to this owner — never
@@ -2257,10 +2258,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 result = self._exit_snapshot(session, "already_exited")
             if not scope_stopped:
                 result["scope_stop_failed"] = session.systemd_unit
-            if by_owner:
-                # The owner asked for this kill and now holds the output: whatever the reader
-                # publishes is not news. Clearing the intent is safe because `consume_output`
-                # already marked the result consumed for every consumer.
+            if by_owner and not finalizing:
+                # The owner asked for this kill and now holds the WHOLE output: whatever the reader
+                # publishes afterwards is not news. Only clear the intent when the drain really
+                # finished — otherwise the reader's own publish would find no intent, no caller, and
+                # wake the agent for a kill it just performed (review r3 B-n1).
                 self._clear_kill_intent(session)
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
