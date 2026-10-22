@@ -234,6 +234,9 @@ def test_receipts_written_by_an_older_build_still_load(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SESSION_ID", "owner-1")
+    # `get_hermes_home()` is resolved (and can be cached) elsewhere in the suite: point the loader at
+    # the temp home directly so this test does not depend on collection order.
+    monkeypatch.setattr(results, "get_hermes_home", lambda: tmp_path)
     directory = tmp_path / "logs" / "process-results"
     directory.mkdir(parents=True)
     old_style = {
