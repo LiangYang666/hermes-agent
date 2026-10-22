@@ -557,8 +557,11 @@ class ProcessSession:
     exit_code: Optional[int] = None             # None while running
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
-    termination_caller: str = ""                # task id that issued the kill ("" = not a tool kill)
-    kill_requested_by_owner: bool = False        # the owner itself asked for this kill (issue #49)
+    termination_caller: str = ""                # task id that COMPLETED the kill ("" = not a tool kill)
+    # Intent, recorded before signalling and cleared whenever the kill does not land (issue #49):
+    # a boolean could not tell "the kill I asked for" from "the exit that happened anyway".
+    kill_intent_caller: str = ""                # task id that asked for a kill, still in flight
+    kill_intent_at: float = 0.0                 # time.time() of that request (0 = none)
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # Recovered from checkpoint (no pipe)
@@ -1628,21 +1631,41 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         three separate turns.
 
         Suppressed only when ALL of these hold, so nothing the agent does NOT know about goes quiet:
-          · the owner itself issued the kill (recorded as INTENT before signalling, so the reader
-            thread winning the finalize race does not make the death look spontaneous);
-          · the exit is a kill from the tool surface, or the plain `exited` receipt that race produces;
-          · `backend_lost`, `failed_start`, supervisor shutdowns and kills issued by ANOTHER session
-            keep waking — in those cases the agent cannot know the job died.
+          · the kill that COMPLETED was issued by the process's owner (`termination_caller`) — or, when
+            the reader thread finalised first, an intent of the owner's that is followed by a
+            signal-shaped exit (negative code / 137 / 143) which is not older than the intent;
+          · the receipt says `killed`, or says `exited` on such a signal death;
+          · `backend_lost`, `failed_start`, supervisor shutdowns, kills issued by ANOTHER session, and
+            any process that simply finished on its own keep waking — the agent cannot know those.
 
         The result itself is untouched: ``poll`` / ``read_log`` still report ``killed`` and the
         output. Only the wake is dropped.
         """
-        if not session.kill_requested_by_owner:
+        owner = (session.owner_task_id or session.task_id or "").strip()
+        if not owner:
             return False
-        if session.completion_reason == "killed":
-            return session.termination_source in ("process.kill", "kill_all")
-        # The reader thread wrote the receipt first (the kill's grace window): still our kill.
-        return session.completion_reason == "exited"
+        who = (session.termination_caller or "").strip()
+        signal_death = (session.exit_code or 0) in (-15, -9, 137, 143)
+        if who and who != owner:
+            # A kill by another task COMPLETED: authoritative, and it is news to this owner — never
+            # let a stale intent of ours mute it (review B2).
+            return False
+        if not who:
+            # The reader thread may have finalised the child inside the SIGKILL grace window, before
+            # the kill path could stamp `termination_caller`. Only believe that when the intent is
+            # ours, the exit happened AFTER the intent, and it looks like OUR signal — anything else
+            # is a process that ended on its own, which the agent has NOT been told about.
+            if not session.kill_intent_caller or session.kill_intent_caller.strip() != owner:
+                return False
+            if session.exited_at and session.kill_intent_at and session.exited_at < session.kill_intent_at:
+                return False
+            if not signal_death:
+                return False
+        reason = session.completion_reason
+        if reason == "killed":
+            return True
+        # A reader-authored `exited` receipt is only our kill when it is a signal death.
+        return reason == "exited" and signal_death
 
     def _publish_finished(self, session: ProcessSession, was_running: bool) -> None:
         self._release_finished_handles(session)
@@ -2203,6 +2226,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        # Record WHO asked and WHEN, at the entry rather than just before the signal: the reader
+        # thread can finalise the child inside the SIGKILL grace window, and the `already_exited`
+        # path below is where a self-kill used to wake the agent (issue #49). Cleared on every
+        # failure path — an intent that outlives a failed kill silences the REAL exit later.
+        owner = (session.owner_task_id or session.task_id or "").strip()
+        by_owner = bool(caller_task_id and owner and caller_task_id.strip() == owner)
+        if by_owner:
+            session.kill_intent_caller = caller_task_id.strip()
+            session.kill_intent_at = time.time()
         if session.exited:
             # A double-forked descendant may still be alive in the systemd scope even
             # though the main process exited — stop the scope to reap survivors.
@@ -2223,16 +2255,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             if consume_output and not finalizing:
                 self._completion_consumed.add(session_id)
             return result
-        # Record the INTENT before signalling (issue #49): the child can exit and be finalised by the
-        # reader thread inside the SIGKILL grace window, and then the receipt says a plain `exited`
-        # while the truth is "the owner killed it". The flag survives that race; the receipt does not.
-        if caller_task_id:
-            owner = (session.owner_task_id or session.task_id or "").strip()
-            if owner and caller_task_id.strip() == owner:
-                session.kill_requested_by_owner = True
         try:
             early = self._signal_kill(session, session_id, consume_output, caller_task_id)
             if early is not None:
+                self._clear_kill_intent(session)
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
@@ -2248,6 +2274,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # real exit; only a still-running session needs tree-death proof.
             survivors = [] if signal_race_exited else self._post_kill_survivors(session)
             if survivors:
+                self._clear_kill_intent(session)
                 alive = ", ".join(map(str, survivors))
                 logger.warning(
                     "Kill incomplete for %s: %d process(es) still alive (%s) — session kept running",
@@ -2263,6 +2290,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # not stop leaves nothing proving they are gone, even when the root exited meanwhile.
             # The session keeps its unit, so a later kill retries the stop.
             if not scope_stopped:
+                self._clear_kill_intent(session)
                 with session._lock:
                     root_exited = session.exited
                 logger.warning("Kill incomplete for %s: systemd scope %s did not stop",
@@ -2285,27 +2313,49 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 # WHO asked (issue #49): a kill the OWNER issued is a decision the agent already has,
                 # so its completion must not wake the agent that made it. See _publish_finished.
                 session.termination_caller = caller_task_id
+                session.kill_intent_caller = ""
+                session.kill_intent_at = 0.0
             # The reader thread can finalise the session while the signal path
             # blocks in the SIGKILL grace window: its ``save_completed_result``
             # then persists this kill as a plain ``exited``. Re-write the receipt
             # so the durable record matches what the caller was told.
             if not self._move_to_finished(session):
-                # The reader thread finished it first: the DURABLE receipt is rewritten below, and the
-                # in-memory one must say the same thing — `poll` after a kill has to report the kill,
-                # not the "exited" the reader happened to catch (issue #49 asserts this).
-                with session._lock:
-                    session.exit_code = -15
-                    session.completion_reason = "killed"
-                    session.termination_source = source
-                    if caller_task_id:
-                        session.termination_caller = caller_task_id
-                save_completed_result(session)
+                # The reader thread finished it first. Rewrite the receipt ONLY when the death really
+                # looks like our signal: a child that exited 0 on its own before the signal landed is
+                # NOT a kill, and stamping -15 on it would replace the truth (exit code, real output)
+                # with a plausible lie the agent can never correct (review M1).
+                reader_receipt_signal = (session.exit_code or 0) in (-15, -9, 137, 143)
+                if reader_receipt_signal:
+                    with session._lock:
+                        session.exit_code = -15
+                        session.completion_reason = "killed"
+                        session.termination_source = source
+                        if caller_task_id:
+                            session.termination_caller = caller_task_id
+                        session.kill_intent_caller = ""
+                        session.kill_intent_at = 0.0
+                    save_completed_result(session)
             self._write_checkpoint()
             return {
-                "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
+                # "killed" only when the receipt really says killed; a child that beat us to its own
+                # exit keeps its own code and status.
+                "status": "killed" if session.completion_reason == "killed" else "exited",
+                "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, **output}
         except Exception as e:
+            self._clear_kill_intent(session)
             return {"status": "error", "error": str(e)}
+
+    @staticmethod
+    def _clear_kill_intent(session: ProcessSession) -> None:
+        """Forget an intent that never became a kill (issue #49).
+
+        The intent exists to survive the reader-thread race, not to outlive a failure: a kill that
+        reported "still alive" / "scope did not stop" is followed by the process exiting on its own,
+        and a stale intent would silence exactly the notice the agent needs.
+        """
+        session.kill_intent_caller = ""
+        session.kill_intent_at = 0.0
 
     @staticmethod
     def _stop_scope(session: ProcessSession) -> bool:
