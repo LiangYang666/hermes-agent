@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Bound on the compaction-continuation walk in ``SessionManager._restore``. Each notification compaction
+# adds one hop; the bound only exists so a corrupt/looping lineage cannot spin a restore.
+_MAX_COMPACTION_CONTINUATIONS = 32
+
 
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values (``E:\\Projects``, ``\\\\wsl.localhost\\``) to POSIX form
@@ -631,6 +635,33 @@ class SessionManager:
         if row is None or row.get("source") != "acp":
             return None
 
+        # Compaction that cannot commit in place ends this row with end_reason='compression' and publishes
+        # the compacted transcript as a continuation row. Our client-facing id never changes, so restoring
+        # THIS row hands the resumed agent the pre-compaction transcript: the tokens the compaction just
+        # removed come straight back, the next request is over the trigger again, and every agent restart
+        # buys another ~95s summary call for nothing (the repeat the operator reports as "压缩又来了").
+        # Follow the edge first — the resumed agent then writes to the tip, which is also the row that must
+        # be reopened (reopening the parent would clear end_reason and break the edge for the next restart).
+        client_session_id = session_id
+        for _ in range(_MAX_COMPACTION_CONTINUATIONS):
+            try:
+                continuation = db.get_compression_continuation(session_id)
+            except Exception:
+                logger.debug("Failed to resolve compaction continuation of %s", session_id, exc_info=True)
+                break
+            if not continuation or continuation == session_id:
+                break
+            try:
+                next_row = db.get_session(continuation)
+            except Exception:
+                next_row = None
+            if next_row is None:
+                break
+            session_id, row = continuation, next_row
+        if session_id != client_session_id:
+            logger.info(
+                "ACP session %s was compacted; restoring from continuation %s", client_session_id, session_id)
+
         # A previous adapter process stamped the row ended at its stdio
         # shutdown (#118216); resuming the conversation reopens it, the same
         # contract the TUI gateway's cold-resume path uses.
@@ -670,7 +701,9 @@ class SessionManager:
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
-        state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
+        # Registered under the CLIENT id: every later session/update and prompt is keyed by it. The agent
+        # itself carries the continuation id, so its writes land on the compacted tip.
+        state = self._install_state(client_session_id, agent, cwd, model or getattr(agent, "model", "") or "",
                                     history, persist=False, mode=restored_mode)
         if restored_reasoning is not None:
             state.reasoning_config = restored_reasoning
@@ -684,7 +717,8 @@ class SessionManager:
         if restored_budget is not None:
             state.context_budget = restored_budget
             apply_context_budget(agent, restored_budget)
-        logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
+        logger.info("Restored ACP session %s from DB (%d messages, tip=%s)",
+                    client_session_id, len(history), session_id)
         return state
 
     # ---- internal -----------------------------------------------------------

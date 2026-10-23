@@ -892,6 +892,28 @@ class SessionSessionsMixin:
         """Persisted YOLO flag; False on any parse failure (resume must never enable the bypass)."""
         return bool(_parse_model_config((session_meta or {}).get("model_config")).get("yolo_mode"))
 
+    def get_compression_continuation(self, session_id: str) -> Optional[str]:
+        """The session this one continued into after a compaction ``session_id`` could not commit in place.
+
+        A rotation ends the parent with ``end_reason='compression'`` and publishes the compacted transcript
+        as a NEW row pointing back at it. A caller holding the parent id — an ACP host keeps one
+        client-facing id for the life of a conversation — must follow that edge before loading history:
+        loading the parent hands back the pre-compaction transcript, so the compaction's whole saving comes
+        straight back and the next turn compacts the same tokens again. Mirrors the continuation predicate
+        :meth:`list_sessions_rich` uses to fold a lineage into one logical conversation.
+        """
+        row = self._read_one(
+            "SELECT child.id FROM sessions child "
+            "JOIN sessions parent ON parent.id = child.parent_session_id "
+            "WHERE parent.id = ? AND parent.end_reason = 'compression' "
+            f"AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
+            f"AND {_delegate_from_json('child.model_config')} IS NULL "
+            "AND COALESCE(child.source, '') != 'tool' "
+            "ORDER BY COALESCE(child.started_at, '') DESC, child.rowid DESC LIMIT 1",
+            (session_id,),
+        )
+        return str(row["id"]) if row else None
+
     def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
         """Get a session by ID (drains queued token deltas first so cost readers see exact totals)."""
         self.flush_token_counts()
