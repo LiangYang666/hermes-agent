@@ -308,6 +308,69 @@ def requested_effort(reasoning_config: Optional[dict]) -> Optional[str]:
     return str(reasoning_config.get("effort") or "").strip().lower() or None
 
 
+_OFF_REASONING_TOKENS = frozenset({"none", "false", "disabled", "off", "no", "0"})
+
+
+def explicit_off_reasoning(reasoning_config: Optional[dict]) -> bool:
+    """True when a reasoning config asks for thinking OFF, in any spelling Hermes accepts.
+
+    ``enabled`` is the toggle, but operators write the off state in more than one shape: the
+    folded form of ``auxiliary.<task>.reasoning_effort: none`` is ``{"enabled": False}``, while a
+    hand-written ``extra_body.reasoning.effort: none`` carries no toggle at all, and YAML/JSON
+    configs produce ``"false"``/``"off"`` strings. To a route whose profile defaults thinking ON
+    (DashScope's ``enable_thinking``, DeepSeek's ``thinking``) those all mean the same thing, and
+    reading only the boolean spelling ships the contradiction: an explicit-off config beside an
+    explicit-on wire field, with the ON one winning (#52).
+    """
+    if not isinstance(reasoning_config, dict):
+        return False
+    if "enabled" in reasoning_config:
+        value = reasoning_config.get("enabled")
+        if isinstance(value, str):
+            if value.strip().lower() not in _OFF_REASONING_TOKENS:
+                return False          # an explicitly truthy toggle ("true") wins over any effort
+            return True
+        if value is not False and value != 0:
+            return False
+        return True
+    for key in ("effort", "level", "thinking_effort"):
+        value = reasoning_config.get(key)
+        if isinstance(value, str) and value.strip().lower() in _OFF_REASONING_TOKENS:
+            return True
+    return False
+
+
+def thinking_off_wire_overrides(extra_body: dict) -> dict:
+    """Wire fields that must flip to OFF, for thinking controls already in ``extra_body``.
+
+    The merge seam needs this when the caller/task said "thinking off" but the profile had been
+    projected from a config that said nothing: the profile then emitted its route DEFAULT, and for
+    DashScope (``enable_thinking``) and DeepSeek (``thinking``) that default is ON — the request
+    shipped the operator's off beside the route's on, and the route obeys the on (#52).
+
+    Only keys already on the wire are rewritten, so this can never invent a control the endpoint
+    would reject; ``preserve_thinking`` is dropped because it only means something while thinking
+    is on. Values already off pass through untouched.
+    """
+    overrides: dict[str, Any] = {}
+    for key, value in (extra_body or {}).items():
+        lower = str(key).strip().lower()
+        if lower == "enable_thinking":
+            if value is not False:
+                overrides[key] = False
+        elif lower == "thinking" and isinstance(value, dict):
+            if str(value.get("type") or "").strip().lower() != "disabled":
+                overrides[key] = {**value, "type": "disabled"}
+        elif lower == "reasoning" and isinstance(value, dict):
+            if value.get("enabled") is not False:
+                overrides[key] = {**value, "enabled": False}
+    if overrides:
+        for key in list((extra_body or {})):
+            if str(key).strip().lower() in {"preserve_thinking", "clear_thinking"}:
+                overrides[key] = None          # removed by the caller
+    return overrides
+
+
 def tokenhub_effort(requested: Optional[str]) -> str:
     """TokenHub's top-level ``reasoning_effort``: ``high`` when no level was chosen, else the
     request clamped to low/medium/high. Shared by the tencent-tokenhub profile and the host-based

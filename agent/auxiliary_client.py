@@ -6685,12 +6685,15 @@ def _merge_aux_extra_body(
     extra_body: Optional[dict], projection: _ProfileProjection, reasoning_config: Optional[dict], provider_norm: str,
 ) -> dict[str, Any]:
     """Caller extra_body + profile body/reasoning + generic reasoning fallback + Nous tags."""
+    from agent.reasoning_effort import explicit_off_reasoning
     merged_extra = dict(extra_body or {})
     caller_reasoning_fields = {
         key: value for key, value in merged_extra.items()
         if str(key).strip().lower() in _PROFILE_REASONING_KEYS and str(key).strip().lower() != "reasoning"
     }
-    caller_disabled = isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False
+    caller_disabled = explicit_off_reasoning(reasoning_config) or (
+        isinstance(extra_body, dict) and explicit_off_reasoning(extra_body.get("reasoning"))
+    )
     if caller_disabled:
         # The caller's thinking-off beats ``auxiliary.<task>.reasoning_effort`` (folded into
         # ``extra_body.reasoning`` by _get_task_extra_body). Dropped BEFORE the profile merge so a
@@ -6714,6 +6717,15 @@ def _merge_aux_extra_body(
     if isinstance(merged_extra.get("reasoning"), dict):
         from agent.reasoning_effort import clamp_reasoning_config
         merged_extra["reasoning"] = clamp_reasoning_config(merged_extra["reasoning"])
+    if caller_disabled:
+        # Last word on the thinking toggle: the operator asked for off, so a profile that projected
+        # its route default (ON for DashScope/DeepSeek) must not have the final say (#52).
+        from agent.reasoning_effort import thinking_off_wire_overrides
+        for key, value in thinking_off_wire_overrides(merged_extra).items():
+            if value is None:
+                merged_extra.pop(key, None)
+            else:
+                merged_extra[key] = value
     # Portal tags + sticky session_id fallback when the profile didn't supply them; session_id
     # keeps aux calls on the main turn's upstream instance (cache warmth) — tags alone are not
     # enough on /v1/messages.
@@ -6769,14 +6781,24 @@ def _build_call_kwargs(
     # OpenAI-compat wire ONCE here, before either path sees the config — the same entry clamp the
     # main transport applies (#89503); MoA aggregator/reference and aux calls 400'd without it (#112010).
     from agent.reasoning_effort import clamp_reasoning_config
+    from agent.reasoning_effort import explicit_off_reasoning as _explicit_off
     from agent.auxiliary_reasoning_floor import known_reasoning_floor
     if isinstance(extra_body, dict):
         task_reasoning = extra_body.get("reasoning")
-        if isinstance(task_reasoning, dict) and "enabled" in task_reasoning:
+        # The hoist covers both the toggle form and the effort-only off forms: a task/call config
+        # that says "thinking off" must reach the projection AS a reasoning config, or a route
+        # whose profile defaults thinking ON projects its own ON field over the operator's ask
+        # and the request ships the contradiction (#52). ``{"enabled": True, ...}`` keeps its old
+        # treatment — it is a config in the projected sense too.
+        if isinstance(task_reasoning, dict) and (
+            "enabled" in task_reasoning or _explicit_off(task_reasoning)
+        ):
             extra_body = dict(extra_body)
             extra_body.pop("reasoning")
             if reasoning_config is None:
-                reasoning_config = task_reasoning
+                reasoning_config = (
+                    {"enabled": False} if _explicit_off(task_reasoning) else task_reasoning
+                )
     reasoning_config = clamp_reasoning_config(
         known_reasoning_floor(reasoning_config, provider_norm, effective_base, model, task))
     projection = _project_provider_profile(provider, provider_norm, model, effective_base, reasoning_config)

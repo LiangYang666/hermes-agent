@@ -2705,7 +2705,10 @@ class TestAuxiliaryTaskExtraBody:
                 "session_search": {
                     "extra_body": {
                         "enable_thinking": False,
-                        "reasoning": {"effort": "none"},
+                        # ``effort: none`` used to ride through verbatim; it now means "thinking
+                        # off" and is normalised through the profile instead (#52), so the merge
+                        # contract is asserted with a level that stays a level.
+                        "reasoning": {"effort": "low"},
                     }
                 }
             }
@@ -2724,7 +2727,7 @@ class TestAuxiliaryTaskExtraBody:
         assert result is response
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs["extra_body"]["enable_thinking"] is False
-        assert kwargs["extra_body"]["reasoning"] == {"effort": "none"}
+        assert kwargs["extra_body"]["reasoning"] == {"effort": "low"}
         assert kwargs["extra_body"]["metadata"] == {"source": "test"}
 
     @pytest.mark.asyncio
