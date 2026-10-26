@@ -68,11 +68,30 @@ def failed_turn_notice(turn_messages: Any) -> str:
     return FAILED_TURN_NOTICE
 
 
+PROVIDER_UNKNOWN_LABEL = "the configured provider"
+"""What failure copy says when a turn recorded no provider at all.
+
+``provider_label("")`` answers ``"OpenRouter"`` — correct for the question ``hermes status`` asks
+("what would be used if nothing is configured"), wrong for the question a failure asks ("who
+answered this call"). A blank provider on a failed turn means the vendor was never recorded, so
+inheriting that default accuses a service the request never reached (#64).
+"""
+
+
 def provider_label_for(provider: Any) -> str:
-    """Human-friendly provider name for chat copy (``"OpenRouter"``, ``"Nous Portal"``…)."""
+    """Human-friendly provider name for chat copy (``"OpenRouter"``, ``"Nous Portal"``…).
+
+    A blank provider yields a neutral label, not the default vendor's name (#64): the sentence then
+    reads "isn't available on the configured provider" instead of blaming one. A *recorded* provider
+    is always labelled for real — that is what keeps ``hermes status``, the Telegram model picker and
+    the gateway copy paths honest, and what the regression test pins.
+    """
+    raw = str(provider or "").strip()
+    if not raw:
+        return PROVIDER_UNKNOWN_LABEL
     from hermes_cli.models import provider_label
 
-    return provider_label(str(provider or ""))
+    return provider_label(raw)
 
 
 # ---- turn_exit_reason → failure verdict (finalize_turn stamps these) --------------------------
