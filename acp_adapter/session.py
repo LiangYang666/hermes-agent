@@ -28,31 +28,43 @@ logger = logging.getLogger(__name__)
 # adds one hop; the bound only exists so a corrupt/looping lineage cannot spin a restore.
 _MAX_COMPACTION_CONTINUATIONS = 32
 
+# A session whose provider cannot be resolved is retried on every prompt of that session, so the
+# fallback warning is emitted once per session id (bounded: oldest entries are dropped wholesale).
+_WARNED_UNROUTABLE: dict[str, None] = {}
+_WARNED_UNROUTABLE_MAX = 512
+
 
 def _heal_custom_identity(provider: str | None, *, base_url: str | None, model: str | None) -> str | None:
     """Return a routable provider identity for a persisted one, or ``None`` when nothing better exists.
 
-    A named custom provider is carried by the agent as its billing class ``"custom"`` — that is a
-    label, not a menu key. Feed it back to ``resolve_runtime_provider`` on a restore and resolution
-    raises; the exception is swallowed and the agent lands on whatever the *config* default is, so a
-    turn written for one endpoint is billed and answered by another vendor (#63). The CLI and the TUI
-    gateway already recover the durable ``custom:<name>`` key from the endpoint (and fresh builds never
-    write the bare class); the ACP restore path is the one that used to skip it.
+    A named custom provider reaches the agent as its billing class ``"custom"`` — a label, not a menu
+    key. Persisting it creates two distinct failures, and they behave differently:
 
-    Everything except a bare ``custom`` is returned unchanged, so a real pivot — the user moved
-    ``model.provider`` to DeepSeek and this session keeps its own ``custom:lab`` — is never "healed"
-    into the new default.
+    * bare ``custom`` still *resolves* — to some compatible endpoint (OpenRouter on a box that has an
+      OpenRouter key), so the session silently bills a vendor it was never configured for and every
+      turn dies as that vendor's ``model_not_found`` (#63);
+    * a key whose config entry has been renamed or deleted (``custom:gone``) *raises* instead, so the
+      caller falls back to the config default and the turn is answered by yet another vendor.
+
+    Both are handled here by recovering the durable ``custom:<name>`` key from the endpoint
+    (preferred) or from the model — the same recovery the CLI and the TUI gateway already perform.
+    The ACP paths (restore and fork) were the ones that skipped it. Anything already routable is
+    returned unchanged, so a deliberate pivot — the user moved ``model.provider`` elsewhere while
+    this session keeps ``custom:lab`` — is never "healed" into the new default.
     """
     raw = str(provider or "").strip()
-    if raw.lower() != "custom":
-        return raw or None
+    if not raw:
+        return None
     try:
         from hermes_cli.runtime_provider import canonical_custom_identity
+        from hermes_cli.runtime_provider_custom import is_routable_provider
+
+        if is_routable_provider(raw):
+            return raw
         return canonical_custom_identity(base_url=base_url or None, model=model or None) or None
     except Exception:
-        logger.debug("Could not recover a custom provider identity for %r", base_url, exc_info=True)
+        logger.debug("Could not recover a provider identity for %r (%r)", provider, base_url, exc_info=True)
         return None
-
 
 
 def _translate_acp_cwd(cwd: str) -> str:
@@ -357,8 +369,16 @@ class SessionManager:
         if not isinstance(parent_reasoning, dict):
             live = getattr(original.agent, "reasoning_config", None)
             parent_reasoning = live if isinstance(live, dict) else None
-        agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None,
-                                 reasoning_config=parent_reasoning)
+        agent = self._make_agent(
+            session_id=new_id, cwd=cwd, model=original.model or None,
+            # A fork continues the parent's *route*, not just its transcript: carrying only the model
+            # hands a custom-entry session to the config default, which is #63's symptom one entry
+            # further along (#63 review A1). ``original.agent`` may itself have just been restored,
+            # in which case its ``provider`` is the bare class and the heal resolves it again here.
+            requested_provider=getattr(original.agent, "provider", None),
+            base_url=getattr(original.agent, "base_url", None),
+            api_mode=getattr(original.agent, "api_mode", None),
+            reasoning_config=parent_reasoning)
         model = getattr(agent, "model", original.model) or original.model
         state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history),
                                     mode=getattr(original, "mode", "") or "")
@@ -545,12 +565,22 @@ class SessionManager:
         # A named custom provider reaches the agent as its billing class ``custom``; writing that into
         # the blob leaves the row with no routable key at all, so a restore can only guess from the
         # endpoint — and when the guess fails it silently bills the config default (#63). Store the
-        # durable ``custom:<name>`` menu key instead; leave the value alone when it cannot be
-        # recovered, since ``custom`` plus the endpoint is still better than nothing.
+        # durable ``custom:<name>`` menu key instead.
+        #
+        # The value written is the *intent* (what this row asked for), never a fallback the resolver
+        # picked after failing: a session whose entry is temporarily unreachable must stay "custom"
+        # so a later restore can heal it, instead of being rewritten into the config default forever.
+        intent = getattr(state.agent, "_acp_requested_provider", None)
+        if not isinstance(intent, str) or not intent.strip():
+            # Mock agents (tests) and agents built by a factory carry no intent; anything else here
+            # would be written into the JSON blob verbatim.
+            intent = None
         healed_provider = _heal_custom_identity(
-            session_meta.get("provider"), base_url=session_meta.get("base_url"), model=model_str)
+            intent or session_meta.get("provider"), base_url=session_meta.get("base_url"), model=model_str)
         if healed_provider:
             session_meta["provider"] = healed_provider
+        elif intent:
+            session_meta["provider"] = intent
         # Session-scoped reasoning effort picked over ACP (config_options) must ride in
         # the metadata blob, or a restart silently reverts thinking depth to the config
         # default while the client UI keeps showing the user's selection.
@@ -808,20 +838,31 @@ class SessionManager:
         }
         resolve_error: Exception | None = None
         # A persisted bare ``custom`` is a billing class, not a menu key; heal it to the durable
-        # ``custom:<name>`` before resolution. Without this the resolve below raises, the handler
-        # swallows it, and the agent lands on the config default — the turn is then answered (and
-        # billed) by a vendor this session was never configured for (#63).
+        # ``custom:<name>`` before resolution. Without this the class still resolves — to whatever
+        # compatible endpoint is configured — so the turn is answered (and billed) by a vendor this
+        # session was never configured for (#63).
         healed_identity = _heal_custom_identity(
             requested_provider, base_url=base_url, model=model or default_model)
         requested_identity = healed_identity or config_provider
-        if requested_provider and str(requested_provider).strip().lower() == "custom" and not healed_identity:
+        if requested_provider and not healed_identity:
             logger.warning(
-                "ACP session %s stored the bare billing class 'custom' with no recoverable provider "
-                "entry (base_url=%r, model=%r); falling back to the config default provider",
-                session_id, base_url, model or default_model)
+                "ACP session %s could not recover a provider entry for %r (base_url=%r, model=%r); "
+                "falling back to the config default provider",
+                session_id, requested_provider, base_url, model or default_model)
         try:
             runtime = resolve_runtime_provider(
                 requested=requested_identity, target_model=(model or default_model) or None)
+            # A *recovered* identity owns the endpoint: if the row's base_url is not where that entry
+            # lives, the row is stale and pairing the entry's key with the old host is a
+            # working-looking request to the wrong place (#63 review C). An explicitly named
+            # ``custom:<name>`` keeps honouring a deliberately overridden base_url.
+            if healed_identity and base_url:
+                entry_url = str(runtime.get("base_url") or "")
+                if entry_url and entry_url.rstrip("/") != base_url.rstrip("/"):
+                    logger.warning(
+                        "ACP session %s: persisted base_url %r is not where %s lives (%r); using the "
+                        "provider entry's endpoint", session_id, base_url, healed_identity, entry_url)
+                    base_url = None
             kwargs.update({
                 "provider": runtime.get("provider"), "api_mode": api_mode or runtime.get("api_mode"),
                 "base_url": base_url or runtime.get("base_url"), "api_key": runtime.get("api_key"),
@@ -836,11 +877,16 @@ class SessionManager:
             resolve_error = exc
             # Not debug: a resolution failure here is the difference between "this session talks to
             # the endpoint it was created for" and "every turn of it silently goes to another
-            # vendor" (#63). The message names the requested identity so the fallback is visible.
-            logger.warning(
-                "ACP session %s could not resolve provider %r (base_url=%r); falling back to the "
-                "config default — turns will be answered by that provider, not this one",
-                session_id, requested_identity, base_url, exc_info=True)
+            # vendor" (#63). Said once per session — an unusable session retries this on every
+            # prompt, and the traceback belongs to the first attempt only.
+            if session_id and session_id not in _WARNED_UNROUTABLE:
+                if len(_WARNED_UNROUTABLE) >= _WARNED_UNROUTABLE_MAX:
+                    _WARNED_UNROUTABLE.clear()
+                _WARNED_UNROUTABLE[session_id] = None
+                logger.warning(
+                    "ACP session %s could not resolve provider %r (base_url=%r); falling back to the "
+                    "config default — turns will be answered by that provider, not this one: %s",
+                    session_id, requested_identity, base_url, exc)
 
         _register_task_cwd(session_id, cwd)
 
@@ -868,4 +914,9 @@ class SessionManager:
             raise
         # ACP stdio: stdout is protocol-only JSON-RPC; agent chatter goes to stderr.
         agent._print_fn = _acp_stderr_print
+        # Keep the *intent* (what the row asked for) next to the result (who actually answered), so the
+        # persist path never writes a fallback back as if it were this session's own provider (#63
+        # review B): that would erase the only evidence a row belongs to a custom entry.
+        if requested_provider:
+            agent._acp_requested_provider = requested_provider  # type: ignore[attr-defined]
         return agent
