@@ -160,6 +160,92 @@ def _parse_model_config(mc: Any) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def _configured_custom_ids(config: Any) -> set[str]:
+    """The routable ``custom:<key>`` ids this config declares (plus the bare class).
+
+    Mirrors ``hermes_cli.models._configured_custom_provider_ids`` but reads the config the caller
+    already has, so one decision never consults two config sources.
+    """
+    ids = {"custom"}
+    try:
+        from hermes_cli.providers import custom_provider_slug
+        cfg = config if isinstance(config, dict) else {}
+        providers = cfg.get("providers")
+        if isinstance(providers, dict):
+            ids.update(
+                custom_provider_slug(str(entry.get("name") or key), str(key))
+                for key, entry in providers.items() if isinstance(entry, dict)
+            )
+        legacy = cfg.get("custom_providers")
+        if isinstance(legacy, list):
+            ids.update(custom_provider_slug(str(entry.get("name") or ""))
+                       for entry in legacy if isinstance(entry, dict))
+    except Exception:
+        logger.debug("could not enumerate configured custom providers", exc_info=True)
+    return ids
+
+
+def _persisted_model_default(model_cfg: Any, config: Any = None) -> tuple[str, str | None]:
+    """``(model, provider)`` from the config's ``model`` block.
+
+    The block is not always in hermes' own shape: a client that persists the picker's choice writes
+    an ACP wire id (``custom:<name>:<model>`` / ``<provider>:<model>``) into ``model.default``. Taken
+    verbatim, that string travels on as the MODEL NAME — ``provider=custom model=<name>:<model>`` —
+    and every upstream answers 404 / model_not_found.
+
+    Splitting it back is only safe when the split cannot destroy a working route, so it is accepted in
+    exactly two shapes:
+
+    * ``custom:<key>:<model>`` where ``custom:<key>`` is an entry this config declares — the #72 shape,
+      and the middle segment is the durable identity, so no guessing is involved;
+    * ``<provider>:<model>`` where the config's own ``model.provider`` normalizes to that provider.
+
+    Everything else stays a model name. ``parse_model_input`` treats 149 names/aliases as provider
+    prefixes, which makes it split legitimate Ollama tags: with ``provider: ollama`` the default
+    ``qwen:7b`` parses as ``("alibaba", "7b")`` — a truncated model name *and* a re-route to another
+    vendor. ``model.default`` is the one place a wrong split is unrecoverable, so the tie goes to the
+    config that is already on disk.
+    """
+    provider: str | None = None
+    model = ""
+    if isinstance(model_cfg, dict):
+        model, provider = str(model_cfg.get("default") or "").strip(), model_cfg.get("provider")
+    elif isinstance(model_cfg, str):
+        model = model_cfg.strip()
+    if not model:
+        return "", provider
+    declared = str(provider or "").strip()
+    if ":" not in model:
+        return model, provider
+    try:
+        from hermes_cli.models import normalize_provider, parse_model_input
+        custom_ids = _configured_custom_ids(config)
+        parsed_provider, parsed_model = parse_model_input(model, declared, custom_ids=custom_ids)
+    except Exception:  # a decision about a config value must not take the session down
+        logger.debug("could not parse model.default %r", model, exc_info=True)
+        return model, provider
+    if not parsed_model or parsed_model == model:
+        return model, provider
+    if parsed_provider.startswith("custom:"):
+        if parsed_provider in custom_ids:
+            return parsed_model, parsed_provider
+        # ``custom:<gone>:<model>``: the prefix bought nothing — keeping the raw value leaves the
+        # failure recognisable instead of naming a model nobody configured.
+        logger.debug("model.default %r names no configured custom entry; keeping it verbatim", model)
+        return model, provider
+    if parsed_provider == "custom":
+        return model, provider
+    if declared and normalize_provider(declared) != parsed_provider:
+        logger.debug("model.default %r would split as %r but model.provider is %r; keeping it verbatim",
+                     model, parsed_provider, declared)
+        return model, provider
+    if not declared:
+        # No provider on disk to corroborate the split: a canonical prefix could just as well be part
+        # of the model's own name (``qwen:7b``), so nothing is claimed.
+        return model, provider
+    return parsed_model, parsed_provider
+
+
 def _session_info(sid: str, cwd: str, model: Any, history_len: int, title: Any, preview: Any,
                   updated_at: Any) -> dict[str, Any]:
     return {"session_id": sid, "cwd": cwd, "model": model, "history_len": history_len,
@@ -806,12 +892,10 @@ class SessionManager:
         from hermes_constants import resolve_reasoning_config
 
         config = load_config()
-        model_cfg = config.get("model")
-        default_model, config_provider = "", None
-        if isinstance(model_cfg, dict):
-            default_model, config_provider = str(model_cfg.get("default") or ""), model_cfg.get("provider")
-        elif isinstance(model_cfg, str):
-            default_model = model_cfg.strip()
+        # A wire id in ``model.default`` becomes a (provider, model) pair here, so everything below —
+        # ``target_model``, ``requested_identity``, ``resolve_runtime_provider`` — sees a bare model
+        # name instead of ``<name>:<model>`` (#72).
+        default_model, config_provider = _persisted_model_default(config.get("model"), config)
 
         if enabled_toolsets is None:
             # The same per-platform resolver as the gateway/cron/api_server: platform_toolsets.acp wins, else
@@ -917,6 +1001,11 @@ class SessionManager:
         # Keep the *intent* (what the row asked for) next to the result (who actually answered), so the
         # persist path never writes a fallback back as if it were this session's own provider (#63
         # review B): that would erase the only evidence a row belongs to a custom entry.
-        if requested_provider:
-            agent._acp_requested_provider = requested_provider  # type: ignore[attr-defined]
+        # The durable name the model picker must mark. ``agent.provider`` is the billing class for a
+        # named endpoint (``custom``) and ``agent.requested_provider`` only carries what was asked for
+        # this *rebuild*; a fresh session's config default is a name too (``custom:<key>``), so record
+        # the resolved intent here and let ``_build_model_state`` read it (#72).
+        intent_identity = requested_provider or requested_identity
+        if intent_identity:
+            agent._acp_requested_provider = intent_identity  # type: ignore[attr-defined]
         return agent
