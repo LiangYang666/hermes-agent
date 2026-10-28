@@ -164,6 +164,10 @@ class _ModelCatalog:
     current_model: str
     current_choice_provider: str
     current_base_url: str
+    # ``custom`` is a billing class only when named endpoints exist to be the identity instead. On a
+    # box with none, ``custom`` + ``model.base_url`` IS the routable identity and the row it owns is
+    # the honest answer (#72).
+    allow_class_identity: bool = False
     models: list[ModelInfo] = field(default_factory=list)
     seen_ids: set[str] = field(default_factory=set)
     seen_semantic_ids: set[str] = field(default_factory=set)
@@ -172,7 +176,17 @@ class _ModelCatalog:
     def __post_init__(self) -> None:
         if self.current_choice_provider == "ollama":
             self.current_choice_provider = "custom:ollama"
-        self._identity_resolved = self.current_choice_provider not in {"", "custom"}
+        self._identity_resolved = (
+            self.current_choice_provider not in {"", "custom"}
+            or (self.allow_class_identity and bool(self.current_choice_provider))
+        )
+
+    @property
+    def identity_resolved(self) -> bool:
+        """Whether the current provider is a NAME (``custom:<name>``/canonical slug) rather than the
+        billing class ``custom``. A row marked ``current`` under an unresolved identity cannot be
+        rendered honestly — it would name a category as if it were the endpoint (#72)."""
+        return self._identity_resolved
 
     def semantic(self, provider_id: str) -> str:
         return _semantic_provider(provider_id, self.normalize_provider)
@@ -193,9 +207,15 @@ class _ModelCatalog:
             row_base_url = str(row.get("api_url") or "").strip().rstrip("/").lower()
             if row.get("native_catalog_empty"):
                 self.empty_authoritative.add(raw_row_provider)
-            if not self._identity_resolved and raw_row_provider in {"ollama", "custom:ollama"} and (
+            if raw_row_provider in {"ollama", "custom:ollama"} and (
                 self.current_base_url and row_base_url == self.current_base_url
-            ):
+            ) and (not self._identity_resolved or (
+                self.current_choice_provider == "custom" and self.allow_class_identity
+            )):
+                # The base_url answers the question: this is the native ollama server, whose rows
+                # already carry a name (``custom:ollama``). Accepting the bare class here would both
+                # leave those rows unmarked and insert a phantom ``Custom · <model>`` next to them.
+                self.allow_class_identity = False
                 self.current_choice_provider = "custom:ollama"
                 self._identity_resolved = True
             row_models = row.get("models")
@@ -213,7 +233,7 @@ class _ModelCatalog:
                 rendered_model = str(model_entry or "").strip()
                 if not rendered_model:
                     continue
-                is_current = rendered_model == self.current_model and (
+                is_current = self.identity_resolved and rendered_model == self.current_model and (
                     self.semantic(encoded_provider) == self.semantic(self.current_choice_provider)
                 )
                 self.add(
@@ -233,6 +253,29 @@ class _ModelCatalog:
                 is_current = named_slug.lower() == current_choice_provider and named_model == self.current_model
                 parts = [f"Provider: {named_label}", str(named_desc or "").strip(), "current" if is_current else ""]
                 self.add(named_slug, named_model, named_model, " • ".join(part for part in parts if part))
+
+
+def _declares_named_endpoint() -> bool:
+    """Whether the config declares a named endpoint at all — independent of listability.
+
+    ``_named_custom_provider_catalogs()`` answers a different question: what could be *enumerated*
+    (it drops entries with no ``models:`` whose ``/models`` probe failed or that need an unset
+    ``key_env``, and returns ``[]`` on any config/import error). Keying "is ``custom`` merely a
+    billing class here" on that made the identity flip with whether a server answered a 1.5 s probe
+    (#72 review round 2)."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        logger.debug("could not read the config for named endpoints", exc_info=True)
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    providers = cfg.get("providers")
+    if isinstance(providers, dict) and any(isinstance(v, dict) for v in providers.values()):
+        return True
+    legacy = cfg.get("custom_providers")
+    return isinstance(legacy, list) and any(isinstance(e, dict) for e in legacy)
 
 
 def build_model_state(model: str, provider: str, base_url: str) -> SessionModelState | None:
@@ -273,13 +316,85 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
             inventory_rows.append(row)
             continue
         row_base = str(row.get("api_url") or "").strip().rstrip("/").lower()
-        if slug.removeprefix("custom:") == current_choice_provider and (current_base == row_base or not canonical_current):
+        bare = slug.removeprefix("custom:")
+        # ``custom`` is the CLASS, not a name: prefixing it yields the non-identity ``custom:custom``,
+        # which no catalog row can ever match (#72).
+        if bare and bare != "custom" and bare == current_choice_provider and (
+            current_base == row_base or not canonical_current
+        ):
             current_choice_provider = f"custom:{current_choice_provider}"
+
+    # A caller that could only report the billing class (``custom``) still has to mark the ENTRY the
+    # session actually runs on. The inventory already knows every endpoint's ``api_url``, and the
+    # named catalogs know every entry's models, so recover the identity here instead of inserting a
+    # row named after the category (#72). Unique match only: a base_url or model that several
+    # entries share is left unresolved rather than guessed, and an unresolved identity marks nothing.
+    if current_choice_provider in {"", "custom"}:
+        def _row_base(row: dict) -> str:
+            return str(row.get("api_url") or "").strip().rstrip("/").lower()
+
+        def _row_model_ids(row: dict) -> set[str]:
+            out: set[str] = set()
+            for entry in row.get("models") or []:
+                if isinstance(entry, dict):
+                    entry = entry.get("id") or entry.get("model") or entry.get("name")
+                text = str(entry or "").strip()
+                if text:
+                    out.add(text)
+            return out
+
+        def _durable(row: dict) -> str:
+            slug = str(row.get("slug") or "").strip().lower()
+            bare = slug.removeprefix("custom:")
+            if not bare or bare == "custom":
+                return ""  # the class bucket is a billing class, never an identity (#72)
+            if slug.startswith("custom:") or row.get("is_user_defined"):
+                return f"custom:{bare}"
+            return normalize_provider(slug)
+
+        legacy_class_owns_url = False
+        if current_base:
+            matched = [r for r in all_rows if _row_base(r) == current_base]
+            owners = {pid for pid in (_durable(r) for r in matched) if pid}
+            # A canonical provider that happens to share the URL (an OpenRouter-compatible relay is
+            # the common case) must not be chosen by URL alone: the client would persist
+            # ``model.provider: openrouter`` as the global default, i.e. a different credential and
+            # none of the entry's extra_headers/api_mode. Only durable ``custom:`` ids may claim it.
+            custom_owners = {pid for pid in owners if pid.startswith("custom:")}
+            if len(custom_owners) == 1:
+                current_choice_provider = custom_owners.pop()
+            elif not custom_owners and matched:
+                # Only the class bucket lives at this url: the identity IS the legacy custom
+                # endpoint, and it answers the question — no model-name guess is allowed after it,
+                # or a relay that serves vendor model names (`gpt-4o`) gets reported as that vendor
+                # and the client persists it as the global default (#72 review).
+                legacy_class_owns_url = True
+        if current_choice_provider in {"", "custom"} and model and not legacy_class_owns_url:
+            # A canonical provider is never inferred from a model name alone: only durable
+            # ``custom:<key>`` identities and named catalogs may claim the model.
+            holders = {pid for pid in (_durable(r) for r in all_rows if model in _row_model_ids(r))
+                       if pid.startswith("custom:")}
+            holders |= {str(slug).strip().lower() for slug, _label, catalog in named_catalogs
+                        if any(named_model == model for named_model, _desc in catalog)}
+            if len(holders) == 1:
+                current_choice_provider = holders.pop()
+
+    # The class bucket (``custom``) is kept alive by the legacy ``model.base_url``. Once the entry is
+    # known, listing it again offers a row whose id (``custom:<model>``) resolves back to the class —
+    # exactly the route that mis-sends the turn — so it is a duplicate, not a choice (#72).
+    if current_choice_provider.startswith("custom:"):
+        inventory_rows = [r for r in inventory_rows if str(r.get("slug") or "").strip().lower() != "custom"]
 
     cat = _ModelCatalog(
         normalize_provider=normalize_provider, current_model=model,
         current_choice_provider=current_choice_provider,
         current_base_url=current_base,
+        # No named endpoint is DECLARED ⇒ ``custom`` is the routable identity, not merely a billing
+        # class. Keyed on the config, not on what could be enumerated (see _declares_named_endpoint).
+        # Either source saying "a named endpoint exists" is enough to demote the class: the config
+        # is authoritative (it survives an unlistable endpoint), the enumerated catalogs cover the
+        # callers that inject them.
+        allow_class_identity=not _declares_named_endpoint() and not named_catalogs,
     )
     cat.add_inventory_rows(inventory_rows, provider_label)
     cat.add_named_catalogs(named_catalogs, current_choice_provider)
@@ -295,18 +410,29 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
     if current_is_empty:
         available_models = [m for m in available_models if " • current" not in str(m.description or "")]
     current_model_id = "" if current_is_empty else encode_model_choice(cat.current_choice_provider, model)
-    if current_model_id and current_model_id not in {item.model_id for item in available_models}:
+    if current_model_id and not cat.identity_resolved:
+        # An id whose provider is the class ``custom`` (or nothing) cannot name a row honestly:
+        # inserting it advertises ``Custom · <model>`` as an endpoint of its own, and the client sends
+        # that invented id back as an explicit pick, re-persisting the wrong route (#72). Mark
+        # nothing — an unmarked list is the honest answer, and it tells the client "no default".
+        current_model_id = ""
+    elif current_model_id and current_model_id not in {item.model_id for item in available_models}:
         provider_name = provider_label(normalized_provider)
         available_models.insert(0, ModelInfo(
             model_id=current_model_id, name=f"{provider_name} · {model}",
             description=f"Provider: {provider_name} • current",
         ))
 
+
     if not available_models and current_is_empty:
         return SessionModelState(available_models=[], current_model_id="")
     if available_models:
+        # The first-row fallback is for a session that has no model at all (nothing to mark). A
+        # session that HAS one, under an identity we could not resolve, must come back unmarked
+        # rather than calling row 0 "current" (#72).
+        fallback = "" if model else available_models[0].model_id
         return SessionModelState(
             available_models=available_models,
-            current_model_id=current_model_id if current_model_id or current_is_empty else available_models[0].model_id,
+            current_model_id=current_model_id if current_model_id or current_is_empty else fallback,
         )
     return None
