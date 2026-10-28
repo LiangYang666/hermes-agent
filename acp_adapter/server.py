@@ -1324,7 +1324,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             usage = Usage(
                 input_tokens=result.get("prompt_tokens", 0), output_tokens=result.get("completion_tokens", 0),
                 total_tokens=result.get("total_tokens", 0), thought_tokens=result.get("reasoning_tokens"),
+                # Both cache buckets, not just reads: ACP's Usage has a `cached_write_tokens` slot
+                # and `prompt_tokens` above already COUNTS writes into the prompt total, so a client
+                # that only sees reads cannot reconcile the two — nor bill the writes, which are the
+                # 1.25×-priced kind on Anthropic-style providers. `result` carries the key via
+                # _SESSION_TOKEN_KEYS in agent/turn_finalizer.py. (issue #71)
                 cached_read_tokens=result.get("cache_read_tokens"),
+                cached_write_tokens=result.get("cache_write_tokens"),
             )
         await self._send_usage_update(state)
         return PromptResponse(stop_reason="cancelled" if cancelled else "end_turn", usage=usage)
