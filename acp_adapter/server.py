@@ -514,7 +514,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         """Authenticated providers + models, from the shared Hermes inventory (same substrate
         as ``hermes model``/TUI/dashboard) so the selector isn't just the current curated list."""
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
-        provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
+        # ``provider`` is the billing class for a named endpoint (a python-side ``custom``), and the
+        # durable identity lives in ``requested_provider`` (``custom:<name>`` / the entry name).
+        # Handing the class to the catalog is what made it insert a ``Custom · <model>`` row named
+        # after a CATEGORY and leave the real entry unmarked (#72).
+        provider = (
+            getattr(state.agent, "requested_provider", None)
+            or getattr(state.agent, "provider", None)
+            or detect_provider()
+            or "openrouter"
+        )
         try:
             picker = build_model_state(model, provider, str(getattr(state.agent, "base_url", "") or ""))
             if picker is not None:

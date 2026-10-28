@@ -160,6 +160,35 @@ def _parse_model_config(mc: Any) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def _persisted_model_default(model_cfg: Any) -> tuple[str, str | None]:
+    """``(model, provider)`` from the config's ``model`` block.
+
+    The block is not always in hermes' own shape: a client that persists the picker's choice writes
+    an ACP wire id (``custom:<name>:<model>`` / ``<provider>:<model>``) into ``model.default``. Taken
+    verbatim, that string travels on as the MODEL NAME — ``provider=custom model=<name>:<model>`` —
+    and every upstream answers 404 / model_not_found. So a wire id is split by the same rule a typed
+    ``/model`` uses (``parse_model_input``), which keeps a model whose own name contains a colon
+    (``anthropic/claude-3.5-sonnet:beta``) intact because its left side is not a provider (#72).
+    """
+    provider: str | None = None
+    model = ""
+    if isinstance(model_cfg, dict):
+        model, provider = str(model_cfg.get("default") or "").strip(), model_cfg.get("provider")
+    elif isinstance(model_cfg, str):
+        model = model_cfg.strip()
+    if not model:
+        return "", provider
+    try:
+        from hermes_cli.models import parse_model_input
+        parsed_provider, parsed_model = parse_model_input(model, str(provider or ""))
+    except Exception:  # a decision about a config value must not take the session down
+        logger.debug("could not parse model.default %r", model, exc_info=True)
+        return model, provider
+    if parsed_model and parsed_model != model:
+        return parsed_model, parsed_provider or provider
+    return model, provider
+
+
 def _session_info(sid: str, cwd: str, model: Any, history_len: int, title: Any, preview: Any,
                   updated_at: Any) -> dict[str, Any]:
     return {"session_id": sid, "cwd": cwd, "model": model, "history_len": history_len,
@@ -806,12 +835,10 @@ class SessionManager:
         from hermes_constants import resolve_reasoning_config
 
         config = load_config()
-        model_cfg = config.get("model")
-        default_model, config_provider = "", None
-        if isinstance(model_cfg, dict):
-            default_model, config_provider = str(model_cfg.get("default") or ""), model_cfg.get("provider")
-        elif isinstance(model_cfg, str):
-            default_model = model_cfg.strip()
+        # A wire id in ``model.default`` becomes a (provider, model) pair here, so everything below —
+        # ``target_model``, ``requested_identity``, ``resolve_runtime_provider`` — sees a bare model
+        # name instead of ``<name>:<model>`` (#72).
+        default_model, config_provider = _persisted_model_default(config.get("model"))
 
         if enabled_toolsets is None:
             # The same per-platform resolver as the gateway/cron/api_server: platform_toolsets.acp wins, else
