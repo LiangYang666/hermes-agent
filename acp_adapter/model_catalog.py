@@ -164,6 +164,10 @@ class _ModelCatalog:
     current_model: str
     current_choice_provider: str
     current_base_url: str
+    # ``custom`` is a billing class only when named endpoints exist to be the identity instead. On a
+    # box with none, ``custom`` + ``model.base_url`` IS the routable identity and the row it owns is
+    # the honest answer (#72).
+    allow_class_identity: bool = False
     models: list[ModelInfo] = field(default_factory=list)
     seen_ids: set[str] = field(default_factory=set)
     seen_semantic_ids: set[str] = field(default_factory=set)
@@ -172,7 +176,9 @@ class _ModelCatalog:
     def __post_init__(self) -> None:
         if self.current_choice_provider == "ollama":
             self.current_choice_provider = "custom:ollama"
-        self._identity_resolved = self.current_choice_provider not in {"", "custom"}
+        self._identity_resolved = (
+            self.current_choice_provider not in {"", "custom"} or self.allow_class_identity
+        )
 
     @property
     def identity_resolved(self) -> bool:
@@ -316,13 +322,23 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
                 return f"custom:{bare}"
             return normalize_provider(slug)
 
+        legacy_class_owns_url = False
         if current_base:
-            owners = {pid for pid in (_durable(r) for r in all_rows if _row_base(r) == current_base) if pid}
+            matched = [r for r in all_rows if _row_base(r) == current_base]
+            owners = {pid for pid in (_durable(r) for r in matched) if pid}
             if len(owners) == 1:
                 current_choice_provider = owners.pop()
-        if current_choice_provider in {"", "custom"} and model:
+            elif not owners and matched:
+                # Only the class bucket lives at this url: the identity IS the legacy custom
+                # endpoint, and it answers the question — no model-name guess is allowed after it,
+                # or a relay that serves vendor model names (`gpt-4o`) gets reported as that vendor
+                # and the client persists it as the global default (#72 review).
+                legacy_class_owns_url = True
+        if current_choice_provider in {"", "custom"} and model and not legacy_class_owns_url:
+            # A canonical provider is never inferred from a model name alone: only durable
+            # ``custom:<key>`` identities and named catalogs may claim the model.
             holders = {pid for pid in (_durable(r) for r in all_rows if model in _row_model_ids(r))
-                       if pid and pid != "custom"}
+                       if pid.startswith("custom:")}
             holders |= {str(slug).strip().lower() for slug, _label, catalog in named_catalogs
                         if any(named_model == model for named_model, _desc in catalog)}
             if len(holders) == 1:
@@ -338,6 +354,8 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
         normalize_provider=normalize_provider, current_model=model,
         current_choice_provider=current_choice_provider,
         current_base_url=current_base,
+        # No named endpoint exists ⇒ ``custom`` is the routable identity, not merely a billing class.
+        allow_class_identity=not named_catalogs,
     )
     cat.add_inventory_rows(inventory_rows, provider_label)
     cat.add_named_catalogs(named_catalogs, current_choice_provider)

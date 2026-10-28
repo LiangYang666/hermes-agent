@@ -518,8 +518,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # durable identity lives in ``requested_provider`` (``custom:<name>`` / the entry name).
         # Handing the class to the catalog is what made it insert a ``Custom · <model>`` row named
         # after a CATEGORY and leave the real entry unmarked (#72).
+        # ``agent.provider`` is the billing class for a named endpoint (a python-side ``custom``);
+        # the durable name this session was configured for is stashed by ``SessionManager._make_agent``
+        # (``_acp_requested_provider``, the same attribute the persist path reads), with
+        # ``agent.requested_provider`` as the fallback for agents built by a factory (#72).
         provider = (
-            getattr(state.agent, "requested_provider", None)
+            getattr(state.agent, "_acp_requested_provider", None)
+            or getattr(state.agent, "requested_provider", None)
             or getattr(state.agent, "provider", None)
             or detect_provider()
             or "openrouter"

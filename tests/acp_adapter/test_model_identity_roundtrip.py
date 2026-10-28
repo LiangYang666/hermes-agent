@@ -123,6 +123,24 @@ class TestBuildModelStateUsesRequestedProvider:
 
         assert seen["provider"] == "custom:lab"
 
+    def test_the_session_manager_attribute_is_read_first(self):
+        from acp_adapter.server import HermesACPAgent
+
+        seen = {}
+
+        def fake_build(model, provider, base_url):
+            seen["provider"] = provider
+            return SimpleNamespace(available_models=[], current_model_id="")
+
+        agent = SimpleNamespace(model="shared-model", provider="custom", requested_provider=None,
+                                _acp_requested_provider="custom:lab", base_url=LAB_URL)
+        state = SimpleNamespace(model=None, agent=agent)
+
+        with patch("acp_adapter.server.build_model_state", side_effect=fake_build):
+            HermesACPAgent._build_model_state(object(), state)
+
+        assert seen["provider"] == "custom:lab"
+
     def test_falls_back_to_provider_when_no_requested_identity(self):
         from acp_adapter.server import HermesACPAgent
 
@@ -141,32 +159,101 @@ class TestBuildModelStateUsesRequestedProvider:
         assert seen["provider"] == "openrouter"
 
 
-class TestPersistedDefaultParsing:
-    def test_three_part_custom_wire_id_is_split(self, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.models.parse_model_input",
-            lambda raw, current, custom_ids=None: ("custom:lab", "DeepSeek-Flash"),
+class TestRequestedIdentityIsWired:
+    """The picker's identity must come from something the ACP build actually sets.
+
+    ``agent.provider`` is the billing class for a named entry, and ``agent.requested_provider`` only
+    carries a rebuild's argument — a fresh session asks for nothing, so ``SessionManager._make_agent``
+    records the resolved intent on ``_acp_requested_provider`` (the attribute the persist path already
+    reads). Without that wiring the picker's only clue is the base_url heuristic.
+    """
+
+    def test_make_agent_records_the_config_default_identity(self, monkeypatch, tmp_path):
+        from acp_adapter.session import SessionManager
+        from tests.acp_adapter.test_acp_reasoning_effort_config import CapturingAgent
+
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n"
+            "  default: custom:lab:Fast\n"
+            "  provider: lab\n"
+            "providers:\n"
+            "  lab:\n"
+            "    name: lab\n"
+            "    base_url: http://127.0.0.1:9000/v1\n"
+            "    models:\n"
+            "      - Fast\n",
+            encoding="utf-8",
         )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr("run_agent.AIAgent", CapturingAgent)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **_kw: {
+                "provider": "custom", "requested_provider": requested,
+                "api_mode": "chat_completions", "base_url": "http://127.0.0.1:9000/v1", "api_key": "k",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda *_a, **_k: None)
+        monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+                            lambda **_kw: None)
+
+        manager = SessionManager(db=object())
+        agent = manager._make_agent(session_id="s-72", cwd=".")
+
+        assert agent._acp_requested_provider == "custom:lab"
+        assert CapturingAgent.last_kwargs["model"] == "Fast"
+
+
+class TestPersistedDefaultParsing:
+    """The persisted default is split only when the split cannot destroy a working route.
+
+    These drive the REAL ``parse_model_input`` (no stubs): the whole point of the guard is how that
+    parser behaves on names like ``qwen:7b``, which stubbing would hide.
+    """
+
+    LAB_CONFIG = {"providers": {"lab": {"api_url": LAB_URL, "name": "lab"}}}
+
+    def test_three_part_custom_id_is_split(self):
         model, provider = _persisted_model_default(
-            {"default": "custom:lab:DeepSeek-Flash", "provider": "lab"}
+            {"default": "custom:lab:DeepSeek-Flash", "provider": "lab"}, self.LAB_CONFIG
         )
 
         assert (model, provider) == ("DeepSeek-Flash", "custom:lab")
 
-    def test_canonical_two_part_id_is_split(self, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.models.parse_model_input",
-            lambda raw, current, custom_ids=None: ("deepseek", "deepseek-flash"),
-        )
-        assert _persisted_model_default({"default": "deepseek:deepseek-flash"}) == ("deepseek-flash", "deepseek")
+    def test_canonical_id_is_split_only_when_the_provider_agrees(self):
+        assert _persisted_model_default(
+            {"default": "deepseek:deepseek-flash", "provider": "DeepSeek"}
+        ) == ("deepseek-flash", "deepseek")
 
-    def test_bare_model_is_untouched(self, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.models.parse_model_input",
-            lambda raw, current, custom_ids=None: (current, raw),
+    def test_a_label_shaped_provider_still_agrees_after_normalisation(self):
+        assert _persisted_model_default(
+            {"default": "deepseek:deepseek-flash", "provider": "DEEPSEEK"}
+        ) == ("deepseek-flash", "deepseek")
+
+    @pytest.mark.parametrize("name,provider", [
+        ("qwen:7b", "ollama"),
+        ("kimi:latest", "ollama"),
+        ("glm:latest", "custom"),
+        ("moonshot:latest", ""),
+        ("qwen:7b", ""),
+    ])
+    def test_a_colon_model_name_is_never_truncated(self, name, provider):
+        # parse_model_input calls these left segments providers (alibaba / kimi-coding / zai), which
+        # used to truncate the model AND re-route the session to another vendor.
+        assert _persisted_model_default({"default": name, "provider": provider}) == (name, provider)
+
+    def test_a_slash_prefixed_colon_name_is_untouched(self):
+        name = "anthropic/claude-3.5-sonnet:beta"
+        assert _persisted_model_default({"default": name, "provider": ""}) == (name, "")
+
+    def test_a_custom_id_naming_no_configured_entry_is_left_verbatim(self):
+        model, provider = _persisted_model_default(
+            {"default": "custom:gone:Fast", "provider": "custom"}, self.LAB_CONFIG
         )
-        assert _persisted_model_default({"default": "qwen3.8-flash", "provider": "lab"}) == (
-            "qwen3.8-flash", "lab")
+
+        assert (model, provider) == ("custom:gone:Fast", "custom")
 
     def test_string_form_and_empty_block(self):
         assert _persisted_model_default("qwen3.8-flash") == ("qwen3.8-flash", None)
@@ -178,4 +265,46 @@ class TestPersistedDefaultParsing:
             raise RuntimeError("inventory exploded")
 
         monkeypatch.setattr("hermes_cli.models.parse_model_input", boom)
-        assert _persisted_model_default({"default": "qwen3.8-flash"}) == ("qwen3.8-flash", None)
+        assert _persisted_model_default({"default": "a:b", "provider": "x"}) == ("a:b", "x")
+
+
+class TestLegacyCustomEndpoint:
+    """A box with no named entries: ``custom`` + ``model.base_url`` is a real, routable identity."""
+
+    @pytest.fixture
+    def legacy_only(self, monkeypatch):
+        rows = [_row("custom", [{"id": "m2"}, {"id": "gpt-4o"}], api_url=LAB_URL)]
+
+        class _Ctx:
+            def with_overrides(self, **_kw):
+                return self
+
+        with patch("hermes_cli.inventory.load_picker_context", return_value=_Ctx()), patch(
+            "hermes_cli.inventory.build_models_payload", return_value={"providers": rows}
+        ), patch.object(catalog_mod, "_named_custom_provider_catalogs", return_value=[]):
+            yield
+
+    def test_the_class_row_stays_current(self, legacy_only):
+        state = build_model_state("m2", "custom", LAB_URL)
+
+        assert state.current_model_id == "custom:m2"
+        assert _marked(state) == ["custom:m2"]
+
+    def test_a_vendor_model_name_never_becomes_a_vendor_inference(self, monkeypatch):
+        # A local relay serving vendor names, with OpenRouter configured and also listing gpt-4o.
+        rows = [
+            _row("custom", [{"id": "gpt-4o"}], api_url=LAB_URL),
+            _row("openrouter", [{"id": "gpt-4o"}], api_url="https://openrouter.ai/api/v1"),
+        ]
+
+        class _Ctx:
+            def with_overrides(self, **_kw):
+                return self
+
+        with patch("hermes_cli.inventory.load_picker_context", return_value=_Ctx()), patch(
+            "hermes_cli.inventory.build_models_payload", return_value={"providers": rows}
+        ), patch.object(catalog_mod, "_named_custom_provider_catalogs", return_value=[]):
+            state = build_model_state("gpt-4o", "custom", LAB_URL)
+
+        assert state.current_model_id == "custom:gpt-4o"
+        assert "openrouter" not in state.current_model_id
