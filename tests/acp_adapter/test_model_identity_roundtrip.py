@@ -205,6 +205,43 @@ class TestRequestedIdentityIsWired:
         assert agent._acp_requested_provider == "custom:lab"
         assert CapturingAgent.last_kwargs["model"] == "Fast"
 
+    def test_a_fork_records_the_healed_name_not_the_billing_class(self, tmp_path):
+        # `fork_session` passes `requested_provider=getattr(original.agent, "provider")`, which is the
+        # billing class for a named endpoint. Recording that would hand `_build_model_state` the class
+        # again and make the picker fall back to guessing from the base_url (#72 review round 2, N5).
+        from acp_adapter.session import SessionManager
+        from tests.acp_adapter.test_acp_reasoning_effort_config import CapturingAgent
+
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n"
+            "  default: Fast\n"
+            "  provider: lab\n"
+            "providers:\n"
+            "  lab:\n"
+            "    name: lab\n"
+            "    base_url: http://127.0.0.1:9000/v1\n"
+            "    models:\n"
+            "      - Fast\n",
+            encoding="utf-8",
+        )
+        with patch.dict("os.environ", {"HERMES_HOME": str(home)}), patch(
+            "run_agent.AIAgent", CapturingAgent
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **_kw: {
+                "provider": "custom", "requested_provider": requested,
+                "api_mode": "chat_completions", "base_url": "http://127.0.0.1:9000/v1", "api_key": "k",
+            },
+        ), patch("acp_adapter.session._register_task_cwd", lambda *_a, **_k: None), patch(
+            "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **_kw: None
+        ):
+            agent = SessionManager(db=object())._make_agent(
+                session_id="s-72-fork", cwd=".", requested_provider="custom", model="Fast")
+
+        assert agent._acp_requested_provider == "custom:lab"
+
 
 class TestPersistedDefaultParsing:
     """The persisted default is split only when the split cannot destroy a working route.
@@ -260,12 +297,95 @@ class TestPersistedDefaultParsing:
         assert _persisted_model_default(None) == ("", None)
         assert _persisted_model_default({"default": ""}) == ("", None)
 
+    @pytest.mark.parametrize("name,expected", [
+        ("custom:m2", "m2"),
+        ("custom:ollama:llama3:8b", "llama3:8b"),
+    ])
+    def test_a_class_wire_id_is_split_not_handed_to_the_upstream(self, name, expected):
+        # Both shapes are emitted by this adapter (older cockpits persisted currentModelId;
+        # add_inventory_rows encodes an ollama row as custom:ollama:<model>). The route stays the
+        # class + model.base_url, so splitting cannot re-route — leaving them whole sends a name no
+        # upstream knows, i.e. 404 on every turn (#72 review round 2, N1).
+        model, provider = _persisted_model_default({"default": name, "provider": "custom"})
+
+        assert (model, provider) == (expected, "custom")
+
     def test_parser_failure_keeps_the_raw_value(self, monkeypatch):
         def boom(*_a, **_k):
             raise RuntimeError("inventory exploded")
 
         monkeypatch.setattr("hermes_cli.models.parse_model_input", boom)
         assert _persisted_model_default({"default": "a:b", "provider": "x"}) == ("a:b", "x")
+
+
+class TestClassIdentityScope:
+    """``custom`` is an identity only where no named endpoint is declared AND none was enumerated."""
+
+    @staticmethod
+    def _patch(rows, named, config):
+        class _Ctx:
+            def with_overrides(self, **_kw):
+                return self
+
+        return [
+            patch("hermes_cli.inventory.load_picker_context", return_value=_Ctx()),
+            patch("hermes_cli.inventory.build_models_payload", return_value={"providers": rows}),
+            patch.object(catalog_mod, "_named_custom_provider_catalogs", return_value=named),
+            patch("hermes_cli.config.load_config", return_value=config),
+        ]
+
+    def test_a_declared_entry_that_cannot_be_listed_still_demotes_the_class(self):
+        # The entry declares no models and its /models probe never answers, so it is absent from the
+        # enumerated catalogs — but it IS configured, and treating its session as the bare class is
+        # what produced a phantom row and an id that 404s (#72 review round 2, N3).
+        rows = [_row("custom", [{"id": "m2"}], api_url=LAB_URL)]
+        patches = self._patch(rows, [], {"providers": {"lab": {"base_url": LAB_URL}}})
+        for ctx in patches:
+            ctx.start()
+        try:
+            state = build_model_state("m2", "custom", LAB_URL)
+        finally:
+            for ctx in patches:
+                ctx.stop()
+
+        assert state.current_model_id == ""
+        assert _marked(state) == []
+
+    def test_an_ollama_endpoint_is_named_even_where_the_class_would_be_allowed(self):
+        rows = [_row("ollama", [{"id": "qwen3"}, {"id": "llama3:8b"}], api_url=LAB_URL)]
+        patches = self._patch(rows, [], {})
+        for ctx in patches:
+            ctx.start()
+        try:
+            state = build_model_state("qwen3", "custom", LAB_URL)
+        finally:
+            for ctx in patches:
+                ctx.stop()
+
+        assert state.current_model_id == "custom:ollama:qwen3"
+        assert _marked(state) == ["custom:ollama:qwen3"]
+        assert "custom:qwen3" not in [m.model_id for m in state.available_models]
+
+    def test_a_canonical_provider_is_never_claimed_by_url_alone(self):
+        # A relay that answers on the same URL as a canonical provider: the session is the legacy
+        # custom endpoint, and persisting `openrouter` as the global default would swap both the
+        # credential and the api_mode (#72 review round 2, N4).
+        url = "https://openrouter.ai/api/v1"
+        rows = [
+            _row("custom", [{"id": "gpt-4o"}], api_url=url),
+            _row("openrouter", [{"id": "gpt-4o"}], api_url=url),
+        ]
+        patches = self._patch(rows, [], {})
+        for ctx in patches:
+            ctx.start()
+        try:
+            state = build_model_state("gpt-4o", "custom", url)
+        finally:
+            for ctx in patches:
+                ctx.stop()
+
+        assert "openrouter" not in state.current_model_id
+        assert state.current_model_id == "custom:gpt-4o"
 
 
 class TestLegacyCustomEndpoint:

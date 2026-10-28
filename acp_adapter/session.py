@@ -160,12 +160,25 @@ def _parse_model_config(mc: Any) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+# Sub-identities of the ``custom`` class that the model catalog itself encodes as
+# ``custom:<sub>:<model>``. They are not config entries, so the config cannot corroborate them.
+_CLASS_SUB_IDS = frozenset({"ollama"})
+
+
 def _configured_custom_ids(config: Any) -> set[str]:
     """The routable ``custom:<key>`` ids this config declares (plus the bare class).
 
     Mirrors ``hermes_cli.models._configured_custom_provider_ids`` but reads the config the caller
     already has, so one decision never consults two config sources.
     """
+    if config is None:
+        # No config in hand: use the parser's own enumeration rather than a weaker default, so a
+        # caller that omits the argument cannot silently lose every ``custom:`` split.
+        try:
+            from hermes_cli.models import _configured_custom_provider_ids
+            return set(_configured_custom_provider_ids())
+        except Exception:
+            logger.debug("could not enumerate configured custom providers", exc_info=True)
     ids = {"custom"}
     try:
         from hermes_cli.providers import custom_provider_slug
@@ -234,7 +247,21 @@ def _persisted_model_default(model_cfg: Any, config: Any = None) -> tuple[str, s
         logger.debug("model.default %r names no configured custom entry; keeping it verbatim", model)
         return model, provider
     if parsed_provider == "custom":
-        return model, provider
+        # ``custom:<model>`` — the class wire id. Two producers, both ours: older cockpits persisted
+        # the picker's ``currentModelId`` verbatim, and ``add_inventory_rows`` still encodes a native
+        # ollama row as ``custom:ollama:<model>``. The provider stays the class either way, so the
+        # route is unchanged and splitting cannot re-route — while returning it verbatim hands an id
+        # no upstream knows to the model API (404 on every turn).
+        head, sep, tail = parsed_model.partition(":")
+        if sep and tail.strip():
+            if head.strip().lower() in _CLASS_SUB_IDS:
+                return tail.strip(), provider
+            # ``custom:<gone>:<model>``: the middle segment names no entry, so the split would leak
+            # half a wire id into the model name. Keeping the raw value keeps the failure
+            # recognisable (and the cockpit refuses to write such an id in the first place).
+            logger.debug("model.default %r names no configured custom entry; keeping it verbatim", model)
+            return model, provider
+        return parsed_model, provider
     if declared and normalize_provider(declared) != parsed_provider:
         logger.debug("model.default %r would split as %r but model.provider is %r; keeping it verbatim",
                      model, parsed_provider, declared)
@@ -1005,7 +1032,11 @@ class SessionManager:
         # named endpoint (``custom``) and ``agent.requested_provider`` only carries what was asked for
         # this *rebuild*; a fresh session's config default is a name too (``custom:<key>``), so record
         # the resolved intent here and let ``_build_model_state`` read it (#72).
-        intent_identity = requested_provider or requested_identity
+        # ``requested_provider`` is what a rebuild was handed — for a fork/resume that is
+        # ``agent.provider``, i.e. the billing class ``custom``; the healed name is the identity, so it
+        # wins. Without this a forked named session goes back to the class and the picker falls back
+        # to guessing from the base_url (#72 review round 2).
+        intent_identity = healed_identity or requested_provider or requested_identity
         if intent_identity:
             agent._acp_requested_provider = intent_identity  # type: ignore[attr-defined]
         return agent

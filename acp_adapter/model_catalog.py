@@ -177,7 +177,8 @@ class _ModelCatalog:
         if self.current_choice_provider == "ollama":
             self.current_choice_provider = "custom:ollama"
         self._identity_resolved = (
-            self.current_choice_provider not in {"", "custom"} or self.allow_class_identity
+            self.current_choice_provider not in {"", "custom"}
+            or (self.allow_class_identity and bool(self.current_choice_provider))
         )
 
     @property
@@ -206,9 +207,15 @@ class _ModelCatalog:
             row_base_url = str(row.get("api_url") or "").strip().rstrip("/").lower()
             if row.get("native_catalog_empty"):
                 self.empty_authoritative.add(raw_row_provider)
-            if not self._identity_resolved and raw_row_provider in {"ollama", "custom:ollama"} and (
+            if raw_row_provider in {"ollama", "custom:ollama"} and (
                 self.current_base_url and row_base_url == self.current_base_url
-            ):
+            ) and (not self._identity_resolved or (
+                self.current_choice_provider == "custom" and self.allow_class_identity
+            )):
+                # The base_url answers the question: this is the native ollama server, whose rows
+                # already carry a name (``custom:ollama``). Accepting the bare class here would both
+                # leave those rows unmarked and insert a phantom ``Custom · <model>`` next to them.
+                self.allow_class_identity = False
                 self.current_choice_provider = "custom:ollama"
                 self._identity_resolved = True
             row_models = row.get("models")
@@ -246,6 +253,29 @@ class _ModelCatalog:
                 is_current = named_slug.lower() == current_choice_provider and named_model == self.current_model
                 parts = [f"Provider: {named_label}", str(named_desc or "").strip(), "current" if is_current else ""]
                 self.add(named_slug, named_model, named_model, " • ".join(part for part in parts if part))
+
+
+def _declares_named_endpoint() -> bool:
+    """Whether the config declares a named endpoint at all — independent of listability.
+
+    ``_named_custom_provider_catalogs()`` answers a different question: what could be *enumerated*
+    (it drops entries with no ``models:`` whose ``/models`` probe failed or that need an unset
+    ``key_env``, and returns ``[]`` on any config/import error). Keying "is ``custom`` merely a
+    billing class here" on that made the identity flip with whether a server answered a 1.5 s probe
+    (#72 review round 2)."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        logger.debug("could not read the config for named endpoints", exc_info=True)
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    providers = cfg.get("providers")
+    if isinstance(providers, dict) and any(isinstance(v, dict) for v in providers.values()):
+        return True
+    legacy = cfg.get("custom_providers")
+    return isinstance(legacy, list) and any(isinstance(e, dict) for e in legacy)
 
 
 def build_model_state(model: str, provider: str, base_url: str) -> SessionModelState | None:
@@ -326,9 +356,14 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
         if current_base:
             matched = [r for r in all_rows if _row_base(r) == current_base]
             owners = {pid for pid in (_durable(r) for r in matched) if pid}
-            if len(owners) == 1:
-                current_choice_provider = owners.pop()
-            elif not owners and matched:
+            # A canonical provider that happens to share the URL (an OpenRouter-compatible relay is
+            # the common case) must not be chosen by URL alone: the client would persist
+            # ``model.provider: openrouter`` as the global default, i.e. a different credential and
+            # none of the entry's extra_headers/api_mode. Only durable ``custom:`` ids may claim it.
+            custom_owners = {pid for pid in owners if pid.startswith("custom:")}
+            if len(custom_owners) == 1:
+                current_choice_provider = custom_owners.pop()
+            elif not custom_owners and matched:
                 # Only the class bucket lives at this url: the identity IS the legacy custom
                 # endpoint, and it answers the question — no model-name guess is allowed after it,
                 # or a relay that serves vendor model names (`gpt-4o`) gets reported as that vendor
@@ -354,8 +389,12 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
         normalize_provider=normalize_provider, current_model=model,
         current_choice_provider=current_choice_provider,
         current_base_url=current_base,
-        # No named endpoint exists ⇒ ``custom`` is the routable identity, not merely a billing class.
-        allow_class_identity=not named_catalogs,
+        # No named endpoint is DECLARED ⇒ ``custom`` is the routable identity, not merely a billing
+        # class. Keyed on the config, not on what could be enumerated (see _declares_named_endpoint).
+        # Either source saying "a named endpoint exists" is enough to demote the class: the config
+        # is authoritative (it survives an unlistable endpoint), the enumerated catalogs cover the
+        # callers that inject them.
+        allow_class_identity=not _declares_named_endpoint() and not named_catalogs,
     )
     cat.add_inventory_rows(inventory_rows, provider_label)
     cat.add_named_catalogs(named_catalogs, current_choice_provider)
