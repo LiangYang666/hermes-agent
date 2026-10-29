@@ -107,7 +107,10 @@ def _drop_ticket(session_id: str, ticket: int) -> None:
         if ticket in line:
             line.remove(ticket)
         if not line:
+            # Nobody is in line: the counter has no one left to order, and resetting it keeps the
+            # table proportional to what is pending instead of to how many sessions ever existed.
             _ARRIVAL_LINE.pop(session_id, None)
+            _ARRIVAL_TICKETS.pop(session_id, None)
 
 
 def _flatten_history_text(value: Any) -> str:
@@ -1097,33 +1100,44 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         not gated on ``is_running``, so a Stop pressed during the wait must end the wait here.
         Without this check the turn would start after the stop, then ``prompt()`` would clear the
         flag on the way in and report ``end_turn`` for a turn the operator had already cancelled.
-
         ``ticket`` is this prompt's ARRIVAL number (taken by ``prompt()`` before its first await).
         Only the oldest ticket still in line may claim; the rest wait their turn. Polling alone
         ordered waiters by whichever timer woke first — measured 1 in 15 reversed, and the loser was
         then ``redirect()``ed into the turn the winner started, i.e. an earlier sentence became a
         correction of a turn begun by a later one.
+
+        A stop is CONSUMED by whoever acts on it. ``cancel_event`` is not cleared by the turn that is
+        cancelled, so a stop left standing would cancel every later prompt on this session — a waiter
+        told "cancelled" must clear it, or the session is dead until it is recreated. A flag that
+        PREDATES this prompt (left by an earlier turn) is not ours to honour: it is dropped when the
+        turn is claimed, exactly as before.
         """
+        event = state.cancel_event
+        stale_stop = bool(event is not None and event.is_set())
         try:
             loop = asyncio.get_running_loop()
             warn_at = loop.time() + COMMAND_HANDOVER_WARN_S
             warned = False
             while True:
-                event = state.cancel_event
-                if event is not None and event.is_set():
-                    logger.info("Session %s: prompt cancelled while waiting for a command", session_id)
-                    return PROMPT_CANCELLED
                 with state.runtime_lock, _ARRIVAL_LOCK:
                     line = _ARRIVAL_LINE.get(session_id) or []
                     if line and line[0] != ticket:
                         pass  # an earlier arrival has not decided yet: it goes first
                     else:
-                        if not state.is_running and not state.command_op:
-                            # Re-checked inside the lock: this is the instant the turn is claimed, so
-                            # a cancel that arrived up to here still wins (there is no await between
-                            # this block and the caller's `cancel_event.clear()`).
-                            if event is not None and event.is_set():
-                                return PROMPT_CANCELLED
+                        idle = not state.is_running and not state.command_op
+                        stopped = bool(event is not None and event.is_set())
+                        if idle and stopped and not stale_stop:
+                            # The operator pressed Stop while this prompt waited. Consume the stop —
+                            # no turn is running, so nothing else can own it — and never start a
+                            # turn they already cancelled.
+                            event.clear()
+                            logger.info("Session %s: prompt cancelled while waiting for a command", session_id)
+                            return PROMPT_CANCELLED
+                        if idle:
+                            if stopped:
+                                # A leftover stop from an earlier turn: aimed at that turn, not this
+                                # one (the turn it was aimed at cleared it on its way in).
+                                event.clear()
                             state.is_running = True
                             state.current_prompt_text = user_text or "[Image attachment]"
                             return None
@@ -1143,6 +1157,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # At DECISION time, not at turn end: the next prompt must not wait for a whole turn to
             # find out it lost. Also on cancellation — a ticket left at the head blocks the session.
             _drop_ticket(session_id, ticket)
+
 
     def _run_agent_turn(
         self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
@@ -1238,6 +1253,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+            # Out of the arrival line BEFORE the handler runs: a mutating command drains the queue
+            # when it finishes, and that drain re-enters `prompt()` — waiting behind our own ticket
+            # would deadlock the session for good (measured: /help hung with a queued prompt).
+            _drop_ticket(session_id, ticket)
             # Off the loop: /model validates through switch_model (network I/O) and /compress
             # calls the LLM; handlers are sync and hold no loop-bound state.
             response_text = await asyncio.to_thread(self._handle_slash_command, user_text, state)

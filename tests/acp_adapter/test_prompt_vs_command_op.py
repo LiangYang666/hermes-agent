@@ -122,6 +122,55 @@ async def test_stop_pressed_while_waiting_cancels_instead_of_running_the_turn():
     assert state.queued_prompts == []
 
 
+@pytest.mark.asyncio
+async def test_the_stop_is_consumed_so_the_session_still_works_afterwards():
+    """A cancelled turn leaves `cancel_event` set; the prompt that was stopped must clear it.
+
+    Without this the flag stands forever and every later prompt on the session answers
+    `cancelled` without running anything — the session is dead until it is recreated.
+    """
+    acp_agent, state, fake, conn = make_agent_and_state()
+    state.command_op = True
+
+    stopped = asyncio.create_task(_say(acp_agent, state, "别跑了"))
+    await asyncio.sleep(0.1)
+    await acp_agent.cancel(session_id=state.session_id)
+    state.command_op = False
+    response = await asyncio.wait_for(stopped, timeout=5)
+    assert response.stop_reason == "cancelled"
+    assert state.cancel_event.is_set() is False, "the stop must be consumed, not left standing"
+
+    after = await asyncio.wait_for(_say(acp_agent, state, "这一句要正常跑"), timeout=5)
+    assert after.stop_reason == "end_turn"
+    assert fake.runs == ["这一句要正常跑"], fake.runs
+
+
+@pytest.mark.asyncio
+async def test_a_stop_from_an_earlier_turn_does_not_cancel_a_new_prompt():
+    """A leftover flag (a turn cancelled while this page was elsewhere) is not aimed at us."""
+    acp_agent, state, fake, conn = make_agent_and_state()
+    state.cancel_event.set()
+
+    response = await asyncio.wait_for(_say(acp_agent, state, "新的一句话"), timeout=5)
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == ["新的一句话"], fake.runs
+
+
+@pytest.mark.asyncio
+async def test_a_slash_command_with_a_queued_prompt_does_not_deadlock():
+    """The mutating-command path drains the queue, and the drain calls prompt() again: the slash
+    prompt has to be OUT of the arrival line by then, or it waits behind its own ticket."""
+    acp_agent, state, fake, conn = make_agent_and_state()
+    state.queued_prompts.append("排队那句")
+
+    response = await asyncio.wait_for(_say(acp_agent, state, "/help"), timeout=5)
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == ["排队那句"], fake.runs
+    assert state.queued_prompts == []
+
+
 class _SlowAgent(FakeAgent):
     """A turn that OUTLIVES the poll interval — the configuration where ordering is decided."""
 
