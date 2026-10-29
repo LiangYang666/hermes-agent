@@ -58,6 +58,12 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
 # ListSessionsRequest has no client-side limit; clients paginate via `cursor`/`next_cursor`.
 _LIST_SESSIONS_PAGE_SIZE = 50
 
+# A prompt that arrives while a state-mutating command holds the session waits for it instead of
+# queueing itself behind a turn that does not exist (see ``_claim_turn_or_queue``). A cold
+# ``switch_model`` does network I/O (~10 s), so this is "a couple of those", not a tight bound.
+COMMAND_HANDOVER_TIMEOUT_S = 20.0
+COMMAND_HANDOVER_POLL_S = 0.02
+
 
 def _flatten_history_text(value: Any) -> str:
     """Persisted content/reasoning (str, or list of ``{"text"}`` / ``{"type": "text", "content"}``
@@ -1008,27 +1014,61 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return (_attach_interrupted_prompt(interrupted_prompt, user_text),) * 2
         return user_text, user_content
 
-    def _claim_turn_or_queue(
+    def _absorb_prompt(
+        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+    ) -> str:
+        """A turn is already on the floor: steer it when the runtime can, else queue. Lock held."""
+        # Redirect steers a live turn; a state-mutating command (command_op) has none.
+        if state.is_running and text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
+            getattr(state.agent, "_supports_active_turn_redirect", False) is True
+        ):
+            try:
+                if state.agent.redirect(user_content):
+                    return "Redirected the active turn with your correction."
+            except Exception:
+                logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
+        state.queued_prompts.append(user_text or "[Image attachment]")
+        return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
+
+    async def _claim_turn_or_queue(
         self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
     ) -> str | None:
         """Mark the session running; if a turn is active, redirect it (text-only, supported
-        runtime) or queue it. Returns the client message when absorbed, else None."""
-        with state.runtime_lock:
-            if not state.is_running and not state.command_op:
-                state.is_running = True
-                state.current_prompt_text = user_text or "[Image attachment]"
-                return None
-            # Redirect steers a live turn; a state-mutating command (command_op) has none.
-            if state.is_running and text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
-                getattr(state.agent, "_supports_active_turn_redirect", False) is True
-            ):
-                try:
-                    if state.agent.redirect(user_content):
-                        return "Redirected the active turn with your correction."
-                except Exception:
-                    logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            state.queued_prompts.append(user_text or "[Image attachment]")
-            return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
+        runtime) or queue it. Returns the client message when absorbed, else None.
+
+        A prompt that lands while a state-mutating command holds the session (``command_op``) is
+        NOT a turn in progress — it is a race. The cockpit replays a new session's picker choices
+        and the operator's first message back to back, and ACP dispatches each JSON-RPC message on
+        its own, so the prompt can arrive while ``session/set_model`` is still running. Queuing it
+        there answered "Queued for the next turn." with ``stop_reason=end_turn`` — a turn that
+        never started — and the prompt's real turn (run later by the drain) then had no turn
+        boundary at all: no stop button, no usage row, no completion notice (issue #74). Waiting
+        for the command to finish is what the caller asked for: one turn, under the model they
+        picked. The wait is bounded; past the deadline we queue as before rather than hang.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + COMMAND_HANDOVER_TIMEOUT_S
+        while True:
+            with state.runtime_lock:
+                if not state.is_running and not state.command_op:
+                    state.is_running = True
+                    state.current_prompt_text = user_text or "[Image attachment]"
+                    return None
+                if state.is_running:
+                    return self._absorb_prompt(state, session_id, user_text, user_content, text_only)
+            # Idle, but a state-mutating command still holds the session: wait for the handover.
+            if loop.time() >= deadline:
+                logger.warning(
+                    "Session %s: a command still held the session after %.0fs; queueing the prompt",
+                    session_id, COMMAND_HANDOVER_TIMEOUT_S,
+                )
+                with state.runtime_lock:
+                    if not state.is_running and not state.command_op:
+                        state.is_running = True
+                        state.current_prompt_text = user_text or "[Image attachment]"
+                        return None
+                    return self._absorb_prompt(state, session_id, user_text, user_content, text_only)
+            await asyncio.sleep(COMMAND_HANDOVER_POLL_S)
 
     def _run_agent_turn(
         self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
@@ -1122,7 +1162,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 await self._drain_queued_prompts(state, session_id, self._conn)
                 return PromptResponse(stop_reason="end_turn")
 
-        absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
+        absorbed = await self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
         if absorbed is not None:
             if self._conn:
                 await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
