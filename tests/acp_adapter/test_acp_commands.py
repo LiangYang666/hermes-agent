@@ -176,24 +176,29 @@ async def test_acp_compress_rejected_while_turn_running():
 
 
 @pytest.mark.asyncio
-async def test_acp_prompt_during_mutating_command_queues_then_runs():
-    """The command_op flag closes the check-then-act window: a prompt arriving while
-    /reset is mid-flight must queue behind it, then run on the cleared history."""
+async def test_acp_prompt_during_mutating_command_waits_then_runs():
+    """The command_op flag closes the check-then-act window: a prompt arriving while /reset is
+    mid-flight must not claim the turn. It now WAITS for the op instead of queueing itself
+    (issue #74): queueing answered "Queued for the next turn." with stop_reason=end_turn — a
+    turn that never started — and the real turn, drained later, had no turn boundary at all."""
     acp_agent, state, fake, _conn = make_agent_and_state()
     loop = asyncio.get_running_loop()
     state.history = [{"role": "user", "content": "earlier"}]
 
-    # Inject inside _cmd_reset: at that point _handle_slash_command already holds
-    # command_op, so the concurrent prompt must queue rather than claim the turn.
+    # Inject inside _cmd_reset: at that point _handle_slash_command already holds command_op.
+    # Scheduled, never awaited from the worker thread — blocking the loop there would deadlock
+    # the very handover this test is about.
     orig_reset = acp_agent._cmd_reset
+    scheduled = {}
 
     def patched_reset(args, st):
-        fut = asyncio.run_coroutine_threadsafe(
+        scheduled["fut"] = asyncio.run_coroutine_threadsafe(
             acp_agent.prompt(
                 session_id=st.session_id,
                 prompt=[TextContentBlock(type="text", text="follow-up")],
-            ), loop)
-        fut.result(timeout=10)
+            ),
+            loop,
+        )
         return orig_reset(args, st)
 
     with patch.object(acp_agent, "_cmd_reset", patched_reset):
@@ -203,19 +208,16 @@ async def test_acp_prompt_during_mutating_command_queues_then_runs():
         )
 
     assert response.stop_reason == "end_turn"
-    # The follow-up queued behind the op, then ran on the cleared history.
+    # The follow-up never went into the queue; it ran as its own turn once the op released.
+    assert state.queued_prompts == []
+    follow = await asyncio.wrap_future(scheduled["fut"])
+    assert follow.stop_reason == "end_turn"
     assert fake.runs == ["follow-up"]
     assert state.history == [
         {"role": "user", "content": "follow-up"},
         {"role": "assistant", "content": "ran: follow-up"},
     ]
     assert state.command_op is False
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio
