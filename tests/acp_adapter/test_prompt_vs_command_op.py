@@ -76,35 +76,101 @@ async def test_prompt_still_queues_when_a_turn_is_really_running():
 
 
 @pytest.mark.asyncio
-async def test_prompt_gives_up_waiting_at_the_deadline_and_queues(monkeypatch):
-    """Bounded: a wedged command must not wedge the operator's sentence forever."""
-    monkeypatch.setattr(server_mod, "COMMAND_HANDOVER_TIMEOUT_S", 0.15)
+async def test_a_slow_command_is_never_answered_as_a_finished_turn(monkeypatch):
+    """No deadline: past the warn threshold the prompt KEEPS waiting.
+
+    Every early answer re-creates issue #74 — "Queued for the next turn." with `end_turn` is a
+    finished turn that never started, and a wedged command would park the sentence in a queue only
+    the wedged path could drain. The escape hatch is the operator's Stop (next test).
+    """
+    monkeypatch.setattr(server_mod, "COMMAND_HANDOVER_WARN_S", 0.05)
     acp_agent, state, fake, conn = make_agent_and_state()
     state.command_op = True
 
-    response = await asyncio.wait_for(_say(acp_agent, state, "先问一句"), timeout=5)
+    task = asyncio.create_task(_say(acp_agent, state, "先问一句"))
+    await asyncio.sleep(0.3)  # well past the warn threshold
+    assert not task.done(), "the prompt must still be waiting"
+    assert state.queued_prompts == []
+    assert _queued_texts(conn) == []
 
+    state.command_op = False
+    response = await asyncio.wait_for(task, timeout=5)
     assert response.stop_reason == "end_turn"
-    assert fake.runs == []
-    assert state.queued_prompts == ["先问一句"]
-    assert len(_queued_texts(conn)) == 1
+    assert fake.runs == ["先问一句"]
+    assert state.queued_prompts == []
 
 
 @pytest.mark.asyncio
-async def test_two_prompts_racing_one_command_stay_ordered():
-    """Two waiters must not merge their turns: each gets its own, in the order they arrived."""
+async def test_stop_pressed_while_waiting_cancels_instead_of_running_the_turn():
+    """`cancel()` is not gated on is_running — a Stop during the wait must win.
+
+    Without this the turn starts after the operator stopped it, `prompt()` clears the flag on the
+    way in, and the response says `end_turn` for a turn that was cancelled.
+    """
     acp_agent, state, fake, conn = make_agent_and_state()
-    fake._supports_active_turn_redirect = False
     state.command_op = True
 
-    first = asyncio.create_task(_say(acp_agent, state, "第一句"))
-    second = asyncio.create_task(_say(acp_agent, state, "第二句"))
-    await asyncio.sleep(0.05)
-    state.command_op = False
-    await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+    task = asyncio.create_task(_say(acp_agent, state, "别跑了"))
+    await asyncio.sleep(0.1)
+    await acp_agent.cancel(session_id=state.session_id)  # the Stop button
+    state.command_op = False  # the command finally lands
 
-    # The fake turn is instantaneous, so the second waiter legitimately finds the session idle
-    # again and runs its own turn. What must never happen is the two sharing one turn, or the
-    # later sentence overtaking the earlier one.
-    assert fake.runs == ["第一句", "第二句"]
+    response = await asyncio.wait_for(task, timeout=5)
+
+    assert response.stop_reason == "cancelled"
+    assert fake.runs == [], "a turn the operator stopped must not run"
     assert state.queued_prompts == []
+
+
+class _SlowAgent(FakeAgent):
+    """A turn that OUTLIVES the poll interval — the configuration where ordering is decided."""
+
+    def run_conversation(self, *, user_message, conversation_history, task_id, **kwargs):
+        import time
+
+        time.sleep(0.3)
+        return super().run_conversation(
+            user_message=user_message, conversation_history=conversation_history, task_id=task_id, **kwargs
+        )
+
+
+def _make_slow():
+    fake = _SlowAgent()
+    manager = SessionManager(agent_factory=lambda **kwargs: fake, db=NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    conn = CaptureConn()
+    acp_agent.on_connect(conn)
+    return acp_agent, state, fake, conn
+
+
+@pytest.mark.asyncio
+async def test_two_prompts_racing_one_command_keep_arrival_order():
+    """Arrival order, even when the first turn outlives the poll interval.
+
+    Ordering by "whichever timer woke first" reversed 1 run in 15 with a realistic turn; the loser
+    was then `redirect()`ed into the winner's turn, i.e. the earlier sentence became a correction of
+    a turn started by a sentence written after it.
+    """
+    for _ in range(8):
+        acp_agent, state, fake, _conn = _make_slow()
+        state.command_op = True
+
+        # No gap: two frames the socket handed over in the same tick. Without arrival ordering they
+        # are ~50/50 — the poll wakes whoever the timer heap likes — which is the inversion.
+        first = asyncio.create_task(_say(acp_agent, state, "第一句"))
+        second = asyncio.create_task(_say(acp_agent, state, "第二句"))
+        await asyncio.sleep(0.05)
+        state.command_op = False
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+
+        assert fake.runs[:1] == ["第一句"], fake.runs
+        # Steer the LIVE turn is a fine fate for the LATER sentence; the earlier one being treated as
+        # a correction of a turn written after it is the bug.
+        assert "第一句" not in fake.redirects, f"the earlier sentence was redirected: {fake.redirects}"
+        if fake.redirects == ["第二句"]:
+            assert fake.runs == ["第一句"], fake.runs
+        else:
+            # Queued behind the slow first turn, then drained after it — never before it.
+            await asyncio.sleep(1.0)
+            assert fake.runs == ["第一句", "第二句"], fake.runs
