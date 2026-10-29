@@ -948,6 +948,15 @@ class SessionManager:
             "reasoning_config": (reasoning_config if isinstance(reasoning_config, dict)
                                  else resolve_reasoning_config(config, model or default_model)),
         }
+        # A session the cockpit spawned as a BYSTANDER (工作播报 observer, #76 D). It watches another
+        # session for a few minutes and says one sentence: long-term memory recall is neither needed
+        # nor wanted there (it is re-read on every beat, so it is pure cost and it drags the wording
+        # toward whatever was recalled), and a background self-review in a read-only viewer runs
+        # `skill_view`/`skill_manage` — i.e. writes — on the operator's tab. Both are switched off for
+        # this build only, per session, because each ACP session is its own process.
+        _observer = os.environ.get("AGENTUS_SESSION_ROLE", "").strip().lower() == "observer"
+        if _observer:
+            kwargs["skip_memory"] = True
         resolve_error: Exception | None = None
         # A persisted bare ``custom`` is a billing class, not a menu key; heal it to the durable
         # ``custom:<name>`` before resolution. Without this the class still resolves — to whatever
@@ -1026,6 +1035,10 @@ class SessionManager:
             raise
         # ACP stdio: stdout is protocol-only JSON-RPC; agent chatter goes to stderr.
         agent._print_fn = _acp_stderr_print
+        if _observer:
+            # The two switches the constructor does not take: no background self-review, and no
+            # memory-write toolset (a bystander must not append to the operator's memory).
+            agent.skip_background_review = True
         # Keep the *intent* (what the row asked for) next to the result (who actually answered), so the
         # persist path never writes a fallback back as if it were this session's own provider (#63
         # review B): that would erase the only evidence a row belongs to a custom entry.
