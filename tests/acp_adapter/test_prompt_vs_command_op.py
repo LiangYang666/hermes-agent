@@ -171,6 +171,56 @@ async def test_a_slash_command_with_a_queued_prompt_does_not_deadlock():
     assert state.queued_prompts == []
 
 
+@pytest.mark.asyncio
+async def test_a_stop_pressed_while_waiting_is_not_swallowed_by_an_earlier_one():
+    """Cancel a turn, retype, press Stop again while the replayed command is still in flight.
+
+    The first Stop is retired with the turn it stopped; the second one belongs to the prompt that
+    is waiting, and honouring it is the whole point of waiting instead of queueing.
+    """
+    acp_agent, state, fake, conn = _make_slow()
+
+    # A turn that gets stopped: its Stop must not outlive it.
+    stopped_turn = asyncio.create_task(_say(acp_agent, state, "第一句"))
+    await asyncio.sleep(0.05)
+    await acp_agent.cancel(session_id=state.session_id)
+    await asyncio.wait_for(stopped_turn, timeout=5)
+    assert state.cancel_event.is_set() is False, "the stop outlived the turn it stopped"
+
+    # A Stop pressed with nothing to stop leaves the flag standing (the page hides Stop when idle,
+    # but a second press after a cancelled turn lands exactly here) …
+    state.command_op = True
+    await acp_agent.cancel(session_id=state.session_id)
+    assert state.cancel_event.is_set() is True
+
+    # … and then a prompt waits behind a command in flight, and is stopped AGAIN while it waits.
+    # That second press is the one that matters: snapshotting the flag at entry made it vanish.
+    waiting = asyncio.create_task(_say(acp_agent, state, "第二句"))
+    await asyncio.sleep(0.1)
+    await acp_agent.cancel(session_id=state.session_id)
+    state.command_op = False
+    response = await asyncio.wait_for(waiting, timeout=5)
+
+    assert response.stop_reason == "cancelled"
+    assert "第二句" not in fake.runs, fake.runs
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_slash_prompt_keeps_its_place_in_line():
+    """"/Users/me/notes.md explain this" is not a command: it falls through to the turn, so it must
+    not leave the arrival line on the way — dropping the ticket there let a later sentence take the
+    floor first (measured 20/20)."""
+    acp_agent, state, fake, conn = _make_slow()
+
+    # Issued back to back: the arrival order is the only thing that decides who gets the floor.
+    first = asyncio.create_task(_say(acp_agent, state, "/Users/me/notes.md 解释一下"))
+    second = asyncio.create_task(_say(acp_agent, state, "第二句"))
+    await asyncio.gather(first, second, return_exceptions=True)
+
+    assert fake.runs, "nothing ran"
+    assert "第二句" not in fake.runs[0], f"a later sentence took the floor first: {fake.runs}"
+
+
 class _SlowAgent(FakeAgent):
     """A turn that OUTLIVES the poll interval — the configuration where ordering is decided."""
 

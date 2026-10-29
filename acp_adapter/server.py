@@ -1106,15 +1106,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         then ``redirect()``ed into the turn the winner started, i.e. an earlier sentence became a
         correction of a turn begun by a later one.
 
-        A stop is CONSUMED by whoever acts on it. ``cancel_event`` is not cleared by the turn that is
-        cancelled, so a stop left standing would cancel every later prompt on this session — a waiter
-        told "cancelled" must clear it, or the session is dead until it is recreated. A flag that
-        PREDATES this prompt (left by an earlier turn) is not ours to honour: it is dropped when the
-        turn is claimed, exactly as before.
+        A stop belongs to ONE prompt. ``_finish_turn`` clears it when it finishes reading it, and a
+        flag still standing when we arrive can only have been pressed against an idle session (nothing
+        to stop), so it is dropped here rather than inherited. Everything the loop sees afterwards
+        arrived after this prompt — including a Stop pressed while we wait, which must cancel this
+        turn: snapshotting the flag at entry (instead of clearing it) made that press vanish, and the
+        turn the operator stopped ran anyway.
         """
         event = state.cancel_event
-        stale_stop = bool(event is not None and event.is_set())
         try:
+            with state.runtime_lock:
+                # No turn running and nothing in flight: a set flag here has no owner.
+                if event is not None and event.is_set() and not state.is_running and not state.command_op:
+                    event.clear()
             loop = asyncio.get_running_loop()
             warn_at = loop.time() + COMMAND_HANDOVER_WARN_S
             warned = False
@@ -1125,19 +1129,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         pass  # an earlier arrival has not decided yet: it goes first
                     else:
                         idle = not state.is_running and not state.command_op
-                        stopped = bool(event is not None and event.is_set())
-                        if idle and stopped and not stale_stop:
-                            # The operator pressed Stop while this prompt waited. Consume the stop —
-                            # no turn is running, so nothing else can own it — and never start a
-                            # turn they already cancelled.
+                        if idle and event is not None and event.is_set():
+                            # Stopped while this prompt waited. Consume the stop — nothing is running,
+                            # so nothing else can own it — and never start a turn already cancelled.
                             event.clear()
                             logger.info("Session %s: prompt cancelled while waiting for a command", session_id)
                             return PROMPT_CANCELLED
                         if idle:
-                            if stopped:
-                                # A leftover stop from an earlier turn: aimed at that turn, not this
-                                # one (the turn it was aimed at cleared it on its way in).
-                                event.clear()
                             state.is_running = True
                             state.current_prompt_text = user_text or "[Image attachment]"
                             return None
@@ -1253,14 +1251,17 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            # Out of the arrival line BEFORE the handler runs: a mutating command drains the queue
-            # when it finishes, and that drain re-enters `prompt()` — waiting behind our own ticket
-            # would deadlock the session for good (measured: /help hung with a queued prompt).
-            _drop_ticket(session_id, ticket)
             # Off the loop: /model validates through switch_model (network I/O) and /compress
             # calls the LLM; handlers are sync and hold no loop-bound state.
             response_text = await asyncio.to_thread(self._handle_slash_command, user_text, state)
             if response_text is not None:
+                # A real command took the prompt; it will NOT take the floor, so it leaves the line
+                # now — BEFORE the drain below, which re-enters `prompt()` and would otherwise wait
+                # behind our own ticket for good (measured: /help hung with a queued prompt).
+                # A "/path/to/file explain this" prompt is not a command and falls through to the
+                # turn path KEEPING its ticket: dropping it here let a later sentence take the floor
+                # first, 20 times out of 20.
+                _drop_ticket(session_id, ticket)
                 if self._conn:
                     await self._conn.session_update(session_id, acp.update_agent_message_text(response_text))
                     await self._send_usage_update(state)
@@ -1479,6 +1480,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 await conn.session_update(session_id, update)
 
         finally:
+            # The turn is over and `cancelled` above has already been read: the stop that stopped it
+            # must not outlive it, or the next prompt inherits a request to abort a turn it never had.
+            event = state.cancel_event
+            if event is not None and event.is_set():
+                event.clear()
             # Go idle before draining so recursive prompt() calls can acquire the session.
             with state.runtime_lock:
                 state.is_running = False
