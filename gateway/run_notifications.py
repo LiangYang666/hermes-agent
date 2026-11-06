@@ -1970,3 +1970,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     platform_name, chat_id, thread_id, self._format_process_running_message(session), watcher,
                 )
         logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)
+        # The row this watcher followed just left "running": publish the new snapshot for its session.
+        # No turn is guaranteed to follow (notifications off, or an agent that already consumed the
+        # result), so this is the only place that news reaches a viewer that cannot read the registry.
+        from gateway.session_authorities import active_authority
+        from gateway.session_background import publish_for_route
+        publish_for_route(active_authority(self), watcher.get("session_key"))

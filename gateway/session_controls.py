@@ -679,6 +679,10 @@ class AuthorityConnection:
             self.actor, ref, history=not omit, replay_from=replay_from if ref.session_id == requested else None)
         self.subscriptions[ref.session_id] = snapshot.subscription_id
         self.handed_back.discard(ref.session_id)
+        # A viewer that just attached cannot see the owner's process registry: hand it the current
+        # background rows (a no-op unless they changed since this session last published them).
+        from gateway.session_background import publish_snapshot
+        publish_snapshot(self.authority.sessions[ref.session_id], ref.session_id)
         self._spawn_notice(ref)
         # Only local routes have a frozen local launch policy to project; with it, main's banner and
         # status-bar inventory (tools, skills, MCP, version, branch) for that policy.

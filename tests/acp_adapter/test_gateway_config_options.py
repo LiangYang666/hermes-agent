@@ -28,7 +28,7 @@ async def test_effort_pick_applies_through_the_reasoning_mutation_and_returns_th
     reply = await agent.set_config_option(config_id='reasoning_effort', session_id='s', value='high')
     assert mutations == [('reasoning', {'effort': 'high'})]
     pickers = {option.category: option.current_value for option in reply.config_options}
-    assert pickers == {'mode': 'ask', 'model': 'openrouter:fixture', 'thought_level': 'high'}
+    assert pickers == {'mode': 'ask', 'model': 'openrouter:fixture', 'thought_level': 'high', 'context': 'auto'}
 
 
 def test_the_effort_picker_offers_default_only_while_no_level_is_set():
@@ -36,7 +36,8 @@ def test_the_effort_picker_offers_default_only_while_no_level_is_set():
     from acp_adapter.modes import DEFAULT_MODE
 
     def effort(level):
-        option = config_options(None, {'reasoning_effort': level}, DEFAULT_MODE)[-1]
+        option = {option.id: option for option in config_options(None, {'reasoning_effort': level},
+                                                                DEFAULT_MODE)}['reasoning_effort']
         return option.current_value, [choice.value for choice in option.options]
     # ``default`` (a reset) reads back as the profile's level: offering it would make the pick jump.
     current, values = effort('medium')

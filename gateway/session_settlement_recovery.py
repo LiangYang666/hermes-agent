@@ -120,6 +120,10 @@ def _publish_completion(authority, live, ref, row, settled, response, captured):
         # line, Desktop toast), so a turn the owner's stop cut short says why (#134889 F1).
         complete['warning'] = notice
     live.event_stream.publish(ref.session_id, complete)
+    # Same lock, right after the turn's own frame: a task this turn left running is news the viewer
+    # can only learn here (it has no access to the registry).
+    from gateway.session_background import publish_snapshot
+    publish_snapshot(live, ref.session_id)
 
 
 RESTART_INTERRUPT_NOTICE = ('Gateway restarting: this turn was interrupted and will not be run again. '

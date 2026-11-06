@@ -58,3 +58,21 @@ def test_the_picker_offers_auto_presets_and_the_sessions_own_value():
     pinned = options({'context_length': 131_072})[CONTEXT_BUDGET_CONFIG_ID]
     assert pinned.current_value == '131072'
     assert [row.value for row in pinned.options][-1] == '131072'
+
+
+@pytest.mark.asyncio
+async def test_background_rows_reach_the_editor_as_a_hermes_frame():
+    """The owner publishes ``background.tasks``; an ACP viewer cannot read the owner's registry, so
+    this frame (an empty thought carrying ``_meta.hermes``) is what a cockpit draws (#22)."""
+    from unittest.mock import AsyncMock
+
+    agent = GatewayACPAgent()
+    agent._gateway, agent._conn = AsyncMock(), AsyncMock()
+    agent._snapshots['s'] = {'execution_generation': 1}
+    tasks = [{'id': 'p1', 'command': 'npm run build', 'pid': 42, 'status': 'running',
+              'uptimeSeconds': 3, 'notifyOnComplete': True, 'kind': 'process'}]
+    await agent._project({'session_id': 's', 'type': 'background.tasks', 'payload': {'tasks': tasks},
+                          'execution_generation': 1, 'seq': 1})
+    update = agent._conn.session_update.await_args.kwargs['update']
+    assert update.field_meta['hermes'] == {'kind': 'background', 'tasks': tasks}
+    assert update.content.text == ''
