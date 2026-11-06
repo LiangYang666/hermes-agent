@@ -53,6 +53,9 @@ class CanonicalCreateParams(ProfileParams):
     # A shell-launched client's allowlisted environment (HERMES_* behaviour values, toolchain PATH/venv),
     # applied to this session only; never echoed in ``launch_request``.
     client_env: dict[str, str] | None = None
+    # A bystander session (a cockpit's observer): no memory recall, no background self-review and
+    # no memory-writing toolset for this session only — the owner is shared with everything else.
+    observer: bool = False
 
 
 class CanonicalResumeParams(ProfileParams):

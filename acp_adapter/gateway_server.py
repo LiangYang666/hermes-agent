@@ -43,6 +43,16 @@ def _slash_command(text):
     return name if name in ROUTES else None
 
 
+def _observing_session() -> bool:
+    """True when this ACP process was spawned as a BYSTANDER (a cockpit's observer, #76 D).
+
+    The cockpit sets ``AGENTUS_SESSION_ROLE=observer`` on the viewer it spawns to watch another
+    session. The role has to be resolved HERE because the owner is a different process shared by
+    every other session and never inherits it.
+    """
+    return (os.environ.get("AGENTUS_SESSION_ROLE") or "").strip().lower() == "observer"
+
+
 def _bypass_route():
     """--safe-mode / --ignore-user-config read no profile default route, so the session freezes the
     launch's explicit one (``hermes -m <model> --provider <name> --safe-mode acp``). Both, refused at
@@ -280,6 +290,12 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         flags = env_launch_flags()
         if flags.get("safe_mode") or flags.get("ignore_user_config"):
             flags.update(_bypass_route())
+        # A BYSTANDER viewer (a cockpit's 工作播报 observer) asks for a session that watches another one
+        # and says one sentence: it must not recall memory, self-review, or write memory for the
+        # operator. This process's env is the only place that role exists, and the owner does not
+        # inherit it, so it is frozen into THIS session's policy or not at all.
+        if _observing_session():
+            flags = {**flags, 'observer': True}
         snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex,
             source="acp", cwd=_translate_acp_cwd(cwd),
             editor={"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
@@ -315,13 +331,13 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             if option.id == EDIT_APPROVAL_POLICY_CONFIG_ID:
                 option.current_value = policy
         if self._conn:
-            task = asyncio.get_running_loop().create_task(self._after_attach(session_id, editor_id))
+            task = asyncio.get_running_loop().create_task(self._after_attach(session_id, editor_id, info))
             self._background.add(task)
             task.add_done_callback(self._background.discard)
         return {"models": models, "modes": modes, "field_meta": meta,
                 "config_options": options}
 
-    async def _after_attach(self, session_id, editor_id):
+    async def _after_attach(self, session_id, editor_id, info=None):
         from acp_adapter.gateway_session_meta import available_commands_update
         await asyncio.sleep(0)  # after the session reply: the editor routes updates by a known id
         try:
@@ -331,6 +347,30 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         except Exception:
             # Boundary: a detached editor or a refused read is not the attach's failure.
             logger.debug("ACP post-attach notices for %s not delivered", session_id, exc_info=True)
+        await self._notify_project_skills(session_id, editor_id, (info or {}).get("cwd"))
+
+    async def _notify_project_skills(self, session_id, editor_id, cwd):
+        """Say, once per attach, that this repo ships skills the agent is NOT loading (#32).
+
+        The interactive CLI has always had a banner for it; on every non-interactive surface they
+        were skipped with no trace at all, so a cockpit could show a playbook-bearing workspace
+        while the agent saw none of the skills in it. Carrier is the protocol's own extension door
+        (``events.make_project_skills_update``), never a transcript line: this is a question the
+        agent asks, not something it said.
+        """
+        from acp_adapter.gateway_session_meta import project_skills_option
+
+        try:
+            option = await asyncio.to_thread(project_skills_option, cwd)
+            meta = (getattr(option, "field_meta", None) or {}) if option is not None else {}
+            if self._conn is None or not meta or getattr(option, "current_value", None) != "ask":
+                return
+            from acp_adapter.events import make_project_skills_update
+            await self._conn.session_update(
+                session_id=editor_id,
+                update=make_project_skills_update(meta["root"], meta["skillCount"]))
+        except Exception:
+            logger.debug("project skills notice for %s not delivered", session_id, exc_info=True)
 
     async def _attach_info(self, client, session_id):
         """``session.info`` for a session to attach. A thread main's in-process server wrote has no
@@ -587,8 +627,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         as main did. The reply is the full list, read back from the owner."""
         from acp.schema import SetSessionConfigOptionResponse
         from acp_adapter.gateway_session_meta import (
-            CONTEXT_BUDGET_CONFIG_ID, REASONING_CONFIG_ID, SERVICE_TIER_CONFIG_ID, SERVICE_TIER_LABELS, current_mode,
-            model_state, reasoning_choices, session_config_options,
+            CONTEXT_BUDGET_CONFIG_ID, PROJECT_SKILLS_CONFIG_ID, REASONING_CONFIG_ID, SERVICE_TIER_CONFIG_ID,
+            SERVICE_TIER_LABELS, current_mode, model_state, reasoning_choices, session_config_options,
         )
         from acp_adapter.modes import EDIT_APPROVAL_POLICY_CONFIG_ID, EDIT_APPROVAL_POLICY_TO_MODE
         editor_id, session_id = session_id, self._held_session(session_id)
@@ -624,6 +664,15 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 if tokens <= 0:
                     raise GatewayClientError('invalid_params')
             await self._idle_control(session_id, 'context_budget', {'tokens': tokens}, 'Context budget')
+        elif config_id == PROJECT_SKILLS_CONFIG_ID:
+            # Profile-level (``skills.trusted_project_dirs``), not a session pin: the gateway owns
+            # the config file AND the agent that must drop its cached skills section, so the
+            # decision goes there even though this viewer is the one that showed the prompt.
+            pick = value.strip().lower() if isinstance(value, str) else value
+            if pick not in {'ask', 'trusted', 'ignore'}:
+                raise GatewayClientError('invalid_params')
+            await (await self._client()).rpc('config.set', session_id=session_id,
+                                             key='project_skills', value=pick)
         info = await (await self._client()).rpc("session.info", session_id=session_id)
         models = await asyncio.to_thread(model_state, info)
         return SetSessionConfigOptionResponse(config_options=await session_config_options(

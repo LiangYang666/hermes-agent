@@ -44,3 +44,29 @@ def test_the_effort_picker_offers_default_only_while_no_level_is_set():
     assert current == 'medium' and 'default' not in values
     current, values = effort('')
     assert current == 'default' and values[0] == 'default'
+
+
+@pytest.mark.asyncio
+async def test_the_project_skills_card_answers_through_the_owner(monkeypatch, tmp_path):
+    """The viewer shows the row; the gateway owns the config file and the agent's cached skills, so
+    the answer is a ``config.set`` RPC — never a local write in this process."""
+    monkeypatch.setattr('acp_adapter.gateway_session_meta.model_state', lambda info: None)
+    info = {'model': 'fixture', 'provider': 'openrouter', 'reasoning_effort': 'medium'}
+    calls = []
+
+    class RPC:
+        async def rpc(self, method, **params):
+            calls.append((method, params))
+            if method == 'session.info':
+                return dict(info)
+            return {'key': 'project_skills', 'value': 'trusted', 'root': '/repo', 'changed': True}
+
+    agent = HermesACPAgent()
+    agent._gateway = RPC()
+    agent._snapshots['s'] = {'revision': 1, 'execution_generation': 1}
+    await agent.set_config_option(config_id='project_skills', session_id='s', value='trusted')
+    assert calls[0] == ('config.set', {'session_id': 's', 'key': 'project_skills',
+                                       'value': 'trusted'})
+
+    with pytest.raises(Exception):
+        await agent.set_config_option(config_id='project_skills', session_id='s', value='sure')
