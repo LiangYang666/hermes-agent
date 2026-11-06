@@ -984,7 +984,7 @@ class GatewayTurnProgressMixin:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
-    def _status_callback_sync(self, event_type: str, message: str) -> None:
+    def _status_callback_sync(self, event_type: str, message: str, *, items=None, truncated: bool = False) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
@@ -1006,8 +1006,14 @@ class GatewayTurnProgressMixin:
             return
         def present():
             if local_viewer_turn(self):
-                self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, prepared),
-                                                          "text": prepared})
+                update = {"kind": _viewer_status_kind(event_type, prepared), "text": prepared}
+                # Structured detail beside the sentence (the recall items behind 「recalled 8
+                # memories」): its own line is unverifiable on its own, and a client that does not
+                # know the keys draws exactly what it drew before.
+                if isinstance(items, (list, tuple)) and items:
+                    update["items"] = list(items)
+                    update["truncated"] = bool(truncated)
+                self._publish_execution("status.update", update)
                 return
             fut = self._schedule(
                 _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
