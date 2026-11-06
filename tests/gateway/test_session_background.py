@@ -78,3 +78,23 @@ def test_a_completion_publishes_for_whichever_session_owns_the_route(monkeypatch
     # Nothing to say for a route no live session owns (a detached viewer's old key).
     assert session_background.publish_for_route(authority, 'route-gone') == 0
     assert session_background.publish_for_route(authority, None) == 0
+
+
+def test_a_ticking_uptime_alone_does_not_send_a_frame(monkeypatch):
+    """`uptimeSeconds` changes every second: if it counted as a change, "publish on change" would
+    publish on every event and the badge would repaint the whole list for nothing."""
+    from gateway import session_background
+    live, published = _live('route-1')
+    row = {'id': 'p1', 'command': 'sleep 20', 'pid': 1, 'status': 'running', 'uptimeSeconds': 1,
+           'notifyOnComplete': True, 'kind': 'process'}
+    monkeypatch.setattr(session_background, '_rows', lambda route: [dict(row)])
+    assert session_background.publish_snapshot(live, 's1') is True
+    row['uptimeSeconds'] = 7
+    monkeypatch.setattr(session_background, '_rows', lambda route: [dict(row)])
+    assert session_background.publish_snapshot(live, 's1') is False
+    # A real change still goes out, and the frame carries the live uptime.
+    row['status'] = 'exited'
+    row['exitCode'] = 0
+    monkeypatch.setattr(session_background, '_rows', lambda route: [dict(row)])
+    assert session_background.publish_snapshot(live, 's1') is True
+    assert published[-1][1]['tasks'][0]['uptimeSeconds'] == 7

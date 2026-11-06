@@ -55,10 +55,16 @@ def _rows(route: str | None) -> list[dict[str, Any]]:
 
 def publish_snapshot(live, session_id: str) -> bool:
     """Publish this session's rows when they changed since the last snapshot. Returns whether a
-    frame went out. Never raises: a status row is not worth failing a settled turn over."""
+    frame went out. Never raises: a status row is not worth failing a settled turn over.
+
+    The change key skips ``uptimeSeconds``: it ticks every second, so including it would make every
+    publish look like a change and turn "publish on change" into "publish on every event" — the
+    field still rides the frame, it just does not decide whether one is sent.
+    """
     try:
         rows = _rows(getattr(live, 'route', None))
-        encoded = json.dumps(rows, sort_keys=True)
+        encoded = json.dumps([{k: v for k, v in row.items() if k != 'uptimeSeconds'} for row in rows],
+                             sort_keys=True)
         if encoded == getattr(live, 'background_json', ''):
             return False
         live.background_json = encoded
