@@ -27,6 +27,44 @@ logger = logging.getLogger(__name__)
 _PLAN_STATUS = {"pending": "pending", "in_progress": "in_progress", "completed": "completed", "cancelled": "completed"}
 
 
+def make_status_update(kind: Any = "lifecycle", text: Any = "", items: Any = None,
+                       truncated: Any = None, **_kwargs: Any) -> Any | None:
+    """A Hermes status line as the ACP frame a host can read — or None when it carries nothing.
+
+    WHY THIS SHAPE. ACP has no status object, and inventing a ``sessionUpdate`` type would be
+    invisible to every existing client while breaking the ones that validate the schema. ``_meta`` is
+    the extension door the protocol DOES leave open, so the carrier is an ordinary thought chunk with
+    an EMPTY text block and the sentence in ``_meta.hermes``::
+
+        {"sessionUpdate": "agent_thought_chunk",
+         "content": {"type": "text", "text": ""},
+         "_meta": {"hermes": {"kind": "status", "statusKind": "lifecycle", "text": "👁️ …"}}}
+
+    A client that does not know the extension renders nothing (an empty thought), which is the honest
+    degradation — better than a fake line in the transcript that would then be persisted as something
+    the agent never said. Status lines are EPHEMERAL: they describe what the process is doing now, so
+    hosts show the latest one for the running turn and forget it at turn-end.
+
+    ``items`` rides the same frame (memory recall: ``[{"text", "tags"?, "type"?}]``) so a host can
+    expand "recalled 8 memories" into the sentences that were recalled. A provider that reports only
+    a count emits exactly what it emitted before — no empty keys on the wire.
+    """
+    import acp as _acp
+    line = str(text or "").strip()
+    if not line:
+        return None
+    update = _acp.update_agent_thought_text("")
+    payload: dict[str, Any] = {"kind": "status", "statusKind": str(kind or "lifecycle"), "text": line}
+    if isinstance(items, (list, tuple)) and items:
+        payload["items"] = list(items)
+    if truncated:
+        payload["truncated"] = True
+    # ``field_meta`` is the model attribute; serialisation goes through ``model_dump(by_alias=True)``,
+    # which is what puts it on the wire as ``_meta``.
+    update.field_meta = {"hermes": payload}
+    return update
+
+
 def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
     """Translate Hermes' todo tool result into ACP's native plan update.
 
