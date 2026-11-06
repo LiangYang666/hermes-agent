@@ -194,6 +194,8 @@ async def config_set(connection, ref, params):
         # Profile-wide like Codex's own switch; every next turn re-reads it (``_load_daybreak``).
         return {'key': key, **await asyncio.to_thread(_write_profile_config, connection,
                                                       lambda cfg: _set_profile_leaf(cfg, 'agent.daybreak', value))}
+    if key == 'project_skills':
+        return await asyncio.to_thread(_set_project_skills, connection, policy, value)
     result = await asyncio.to_thread(_write_profile_config, connection,
                                      lambda cfg: _set_display(cfg, key, value))
     if key == 'focus' and ref.session_id and 'tool_progress' in result:
@@ -282,6 +284,43 @@ async def _set_fast(connection, ref, policy, value):
     from gateway.session_busy_controls import service_tier_config
     service_tier_config(connection, ref, {'session_id': ref.session_id, 'value': raw})
     return {'key': 'fast', 'value': service_tier_word(tier)}
+
+
+def _set_project_skills(connection, policy, value):
+    """Trust / ignore the repo this SESSION runs in (``skills.trusted_project_dirs``).
+
+    The same decision `hermes skills trust` makes, written through the gateway's own atomic
+    profile writer — so a cockpit click and a CLI command cannot disagree on disk, and the agent
+    (which lives in THIS process) drops its cached skills section so the very next turn sees it.
+    The root comes from the session's policy cwd: a cockpit session may be in another repo than
+    the gateway's own cwd.
+    """
+    from agent.skill_utils import apply_project_root_decision, find_project_root
+    from agent.prompt_builder import clear_skills_system_prompt_cache
+
+    if policy is None or not getattr(policy, 'cwd', None):
+        # "Trust this repo" needs to know WHICH repo: a profile-level call names none.
+        raise RuntimeStoreError('invalid_params')
+    root = find_project_root(Path(policy.cwd))
+    if root is None:
+        raise RuntimeStoreError('invalid_params')
+    pick = str(value or '').strip().lower()
+    if pick not in {'ask', 'trusted', 'ignore'}:
+        raise RuntimeStoreError('invalid_params')
+
+    def _edit(cfg):
+        skills_cfg = cfg.get('skills')
+        if not isinstance(skills_cfg, dict):
+            skills_cfg = {}
+            cfg['skills'] = skills_cfg
+        return apply_project_root_decision(skills_cfg, root, pick)
+
+    changed = _write_profile_config(connection, _edit)
+    if changed:
+        # The skills section is built per turn; dropping the cache is what makes the NEXT turn
+        # load (or stop loading) this repo's skills — the same call skills reload uses.
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    return {'key': 'project_skills', 'value': pick, 'root': str(root), 'changed': changed}
 
 
 def _set_personality(connection, value):
