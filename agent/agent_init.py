@@ -1738,6 +1738,14 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
 
     _model_cfg = _agent_cfg.get("model", {})
     _model_section = _model_cfg if isinstance(_model_cfg, dict) else {}
+    # The context budget is the SESSION's own. A gateway turn's config is the owning profile's, so a
+    # cockpit slot's ceiling lives on its launch policy instead: take ``model.context_length`` from
+    # there when the session pinned one (a plain CLI run has no active policy and reads the config).
+    with suppress(Exception):
+        from gateway.session_policy import session_context_pin
+        _session_pin = session_context_pin()
+        if _session_pin is not None:
+            _model_section = {**_model_section, "context_length": _session_pin}
 
     _config_context_length = _model_section.get("context_length")
     if _config_context_length is not None:

@@ -587,8 +587,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         as main did. The reply is the full list, read back from the owner."""
         from acp.schema import SetSessionConfigOptionResponse
         from acp_adapter.gateway_session_meta import (
-            REASONING_CONFIG_ID, SERVICE_TIER_CONFIG_ID, SERVICE_TIER_LABELS, current_mode, model_state,
-            reasoning_choices, session_config_options,
+            CONTEXT_BUDGET_CONFIG_ID, REASONING_CONFIG_ID, SERVICE_TIER_CONFIG_ID, SERVICE_TIER_LABELS, current_mode,
+            model_state, reasoning_choices, session_config_options,
         )
         from acp_adapter.modes import EDIT_APPROVAL_POLICY_CONFIG_ID, EDIT_APPROVAL_POLICY_TO_MODE
         editor_id, session_id = session_id, self._held_session(session_id)
@@ -610,6 +610,20 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 raise GatewayClientError('invalid_params')
             self._unacked.pop(session_id, None)
             await (await self._client()).rpc('config.set', session_id=session_id, key='fast', value=value)
+        elif config_id == CONTEXT_BUDGET_CONFIG_ID:
+            # A number of tokens, or ``auto`` to hand the window back to the model. Anything else is
+            # refused here rather than written as a pin the next turn would choke on.
+            raw = value.strip() if isinstance(value, str) else value
+            if isinstance(raw, str) and raw.lower() in {'', 'auto', 'none'}:
+                tokens = None
+            else:
+                try:
+                    tokens = int(raw)
+                except (TypeError, ValueError):
+                    raise GatewayClientError('invalid_params') from None
+                if tokens <= 0:
+                    raise GatewayClientError('invalid_params')
+            await self._idle_control(session_id, 'context_budget', {'tokens': tokens}, 'Context budget')
         info = await (await self._client()).rpc("session.info", session_id=session_id)
         models = await asyncio.to_thread(model_state, info)
         return SetSessionConfigOptionResponse(config_options=await session_config_options(
