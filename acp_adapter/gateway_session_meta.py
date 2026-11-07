@@ -173,13 +173,20 @@ def usage_update(stats: dict) -> UsageUpdate | None:
 
 
 def turn_usage(stats) -> Usage | None:
-    """``PromptResponse.usage``: the agent's session counters, the figures main's turn result carried."""
+    """``PromptResponse.usage``: the agent's session counters, the figures main's turn result carried.
+
+    Both cache buckets are forwarded, and an unreported bucket stays ``None``: ``input_tokens`` is the
+    FULL prompt (fresh + read + write), so a client that is told "read only" both reconciles the
+    prompt total wrongly and bills the writes as free (issue #71). A zero here would be a measured
+    value nobody measured.
+    """
     if not isinstance(stats, dict):
         return None
     return Usage(input_tokens=int(stats.get("input_tokens") or 0), output_tokens=int(stats.get("output_tokens") or 0),
                  total_tokens=int(stats.get("total_tokens") or 0),
                  thought_tokens=stats.get("reasoning_tokens") or None,
-                 cached_read_tokens=stats.get("cache_read_tokens") or None)
+                 cached_read_tokens=stats.get("cache_read_tokens") or None,
+                 cached_write_tokens=stats.get("cache_write_tokens") or None)
 
 
 def title_update(title: str) -> SessionInfoUpdate:
