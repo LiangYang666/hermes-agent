@@ -57,9 +57,17 @@ def logical_session_id(path, session_id):
     if not path.exists():
         return session_id
     with SessionDB(db_path=path, read_only=True) as db:
-        lineage = db.get_compression_lineage(session_id)
-        root = lineage[0] if lineage else session_id
-        return _local_owners(db).get(root, root)
+        lineage = list(db.get_compression_lineage(session_id) or [session_id])
+        owners = _local_owners(db)
+        # An editor that talked to the pre-gateway ACP server holds the chain's CREATION id, while
+        # `sessions adopt` binds a pre-gateway chat at its compression TIP only (the receipt's
+        # lineage is [tip], enforced by validate_local_lineage). Looking the owner up at the root
+        # alone therefore misses every adopted chain and the gateway answers `not_found`. Walk the
+        # chain tip-first instead: whichever segment carries a receipt names the owner.
+        for candidate in reversed(lineage):
+            if candidate in owners:
+                return owners[candidate]
+        return lineage[0]
 
 
 def catalog_sessions(path, cwd=None):
