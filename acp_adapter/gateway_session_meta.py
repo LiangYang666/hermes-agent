@@ -111,7 +111,7 @@ def config_options(models: SessionModelState | None, info: dict, mode_id: str) -
     budget_rows += [(str(tokens), f"{tokens // 1024}K") for tokens in CONTEXT_BUDGET_PRESETS]
     if budget_current != "auto" and budget_current not in {value for value, _ in budget_rows}:
         budget_rows.append((budget_current, f"{budget_current} (custom)"))
-    options.append(select(CONTEXT_BUDGET_CONFIG_ID, "Context budget", "other", budget_current, budget_rows))
+    options.append(select(CONTEXT_BUDGET_CONFIG_ID, "Context budget", "context", budget_current, budget_rows))
     return options
 
 

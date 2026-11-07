@@ -61,6 +61,9 @@ class LiveSession:
     # Set by ``_schedule`` while a drain is alive. The claim commits off-loop, so input admitted
     # after its transaction read the FIFO would otherwise be stranded by a drain that exits idle.
     rescan: bool = False
+    # The last ``background.tasks`` payload published for this session (JSON), so a snapshot is only
+    # sent when it changed — turn settlement, a drained completion and an attach all try.
+    background_json: str = ''
     # admission id -> its started claim, from the moment the settlement worker starts the terminal
     # write until the completion frame is published. The write runs outside ``event_stream.lock``
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock

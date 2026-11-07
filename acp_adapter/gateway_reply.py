@@ -79,10 +79,16 @@ class GatewayReplyMixin:
         ``reasoning.delta``: the model's reasoning as thought chunks. It never enters the reply's segments,
         so ``message.complete``'s final remainder is unchanged.
         ``todo.updated``: the owner's full todo snapshot (published for a LOCAL session's turn, which an ACP
-        session is) as the native ``plan`` update Zed renders as its task panel (#134889 ACP-5)."""
+        session is) as the native ``plan`` update Zed renders as its task panel (#134889 ACP-5).
+        ``background.tasks``: the owner's background processes for this session. An ACP viewer cannot
+        read the owner's registry, so this frame is the only way a cockpit draws 「N 个任务还在跑」;
+        main's ``BackgroundRelay`` drew the same rows (issue #22)."""
         if kind == "reasoning.delta":
             text = _text(payload)
             update = self._chunk(sid, text, thought=True) if text else None
+        elif kind == "background.tasks":
+            from acp_adapter.events import make_background_update
+            update = make_background_update(payload.get("tasks"))
         elif kind == "status.update":
             # The owner already publishes the status line it shows its own viewers
             # (``run_turn_progress._status_callback_sync``); ACP carries it in ``_meta.hermes``.

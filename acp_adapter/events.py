@@ -65,6 +65,23 @@ def make_status_update(kind: Any = "lifecycle", text: Any = "", items: Any = Non
     return update
 
 
+def make_background_update(tasks: Any) -> Any | None:
+    """The owner's background processes as the ACP frame a host draws (issue #22).
+
+    Same door as a status line — an empty thought chunk with the payload in ``_meta.hermes`` — but a
+    different KIND: this is state (the whole list, replacing the last one), not a sentence. ``tasks``
+    keeps the owner's own shape (``{id, command, pid, status, uptimeSeconds, exitCode?,
+    notifyOnComplete, kind}``), so a host's reader is the one it already had.
+    """
+    if not isinstance(tasks, (list, tuple)):
+        return None
+    import acp as _acp
+    update = _acp.update_agent_thought_text("")
+    # ``field_meta`` is the model attribute; ``model_dump(by_alias=True)`` puts it on the wire as ``_meta``.
+    update.field_meta = {"hermes": {"kind": "background", "tasks": list(tasks)}}
+    return update
+
+
 def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
     """Translate Hermes' todo tool result into ACP's native plan update.
 

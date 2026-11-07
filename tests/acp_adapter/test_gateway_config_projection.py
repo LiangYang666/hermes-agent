@@ -21,7 +21,8 @@ async def test_another_surfaces_mode_and_effort_change_resend_the_config_options
     shown = [{option.category: option.current_value for option in call.kwargs['update'].config_options}
              for call in agent._conn.session_update.await_args_list
              if call.kwargs['update'].session_update == 'config_option_update']
-    assert shown == [{'mode': 'session', 'thought_level': 'medium'}, {'mode': 'session', 'thought_level': 'high'}]
+    assert shown == [{'mode': 'session', 'thought_level': 'medium', 'context': 'auto'},
+                     {'mode': 'session', 'thought_level': 'high', 'context': 'auto'}]
 
 
 @pytest.mark.asyncio
