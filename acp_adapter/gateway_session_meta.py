@@ -75,6 +75,9 @@ CONTEXT_BUDGET_CONFIG_ID = "context_budget"
 # The presets a cockpit shows; anything else is still accepted (the operator may type a number), so
 # the list is a shortcut, not a closed set.
 CONTEXT_BUDGET_PRESETS = (262_144, 524_288, 786_432, 1_048_576)
+# Project-local skills' trust decision (``skills.trusted_project_dirs``): the setter of the notice
+# ``gateway_server`` pushes. Repo-scoped, so the value round-trips through the gateway.
+PROJECT_SKILLS_CONFIG_ID = "project_skills"
 SERVICE_TIER_LABELS = {"normal": "Normal", "fast": "Fast", "auto": "Auto", "cold": "Cold", "ultrafast": "Ultrafast"}
 
 
@@ -112,7 +115,60 @@ def config_options(models: SessionModelState | None, info: dict, mode_id: str) -
     if budget_current != "auto" and budget_current not in {value for value, _ in budget_rows}:
         budget_rows.append((budget_current, f"{budget_current} (custom)"))
     options.append(select(CONTEXT_BUDGET_CONFIG_ID, "Context budget", "context", budget_current, budget_rows))
+    project = project_skills_option(info.get("cwd"))
+    if project is not None:
+        options.append(project)
     return options
+
+
+def project_skills_option(cwd) -> "SessionConfigOptionSelect | None":
+    """The trust row for the repo this SESSION runs in, or None when it ships no project skills.
+
+    Project-local skills (``<repo>/.agents/skills``, ``.hermes/skills``) used to have ONE outlet —
+    the interactive CLI banner — so every non-interactive surface silently skipped them and a
+    cockpit showing a playbook-bearing workspace looked like the skills were loaded. This is the
+    setter; ``gateway_server`` pushes the notice. Resolved from the SESSION's cwd, never the
+    process cwd (they differ for every session but the first).
+
+    The selection semantics live in the gateway (``config.set key='project_skills'``): the agent
+    runs there, so that is the process that must drop its cached skills section.
+    """
+    if not cwd:
+        return None
+    from agent.skill_utils import find_project_root, is_project_root_ignored, project_skills_state
+
+    try:
+        root = find_project_root(Path(cwd))
+        if root is None:
+            return None
+        trusted, count = project_skills_state(root)
+    except OSError:
+        return None
+    if not count:
+        return None
+    if trusted:
+        current, description = "trusted", f"{count} skill(s) from this repo are loaded."
+    elif is_project_root_ignored(root):
+        current, description = "ignore", f"{count} skill(s) in this repo stay off (you chose 'never ask')."
+    else:
+        current, description = "ask", (
+            f"{count} skill(s) in this repo are NOT loaded. A project skill is instructions the "
+            "agent will follow, so enabling one is a security decision — trust is per repo root "
+            "and persists (skills.trusted_project_dirs).")
+    return SessionConfigOptionSelect(
+        id=PROJECT_SKILLS_CONFIG_ID,
+        name="Project skills",
+        category="context",
+        type="select",
+        current_value=current,
+        description=description,
+        options=[SessionConfigSelectOption(value="ask", name="Ask me (not loaded)"),
+                 SessionConfigSelectOption(value="trusted", name=f"Trust this repo ({count} skills)"),
+                 SessionConfigSelectOption(value="ignore", name="Never ask for this repo")],
+        field_meta={"root": str(root), "skillCount": count, "scope": "repo",
+                    "note": "Same decision as `hermes skills trust <root>`: written to config.yaml "
+                            "and applied to the next turn of every session in this repo."},
+    )
 
 
 async def session_config_options(client, session_id, models, info, mode_id):

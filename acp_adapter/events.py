@@ -10,6 +10,7 @@ import asyncio
 import logging
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict
 
 import acp
@@ -79,6 +80,27 @@ def make_background_update(tasks: Any) -> Any | None:
     update = _acp.update_agent_thought_text("")
     # ``field_meta`` is the model attribute; ``model_dump(by_alias=True)`` puts it on the wire as ``_meta``.
     update.field_meta = {"hermes": {"kind": "background", "tasks": list(tasks)}}
+    return update
+
+
+def make_project_skills_update(root: str, count: int) -> Any:
+    """「这个仓库有 N 个项目 skill 没启用」 as the ACP frame a host turns into a decidable card.
+
+    Same door again — an empty thought chunk, payload in ``_meta.hermes`` — but a KIND of its own:
+    it is a QUESTION (trust this repo or not), not state, and the answer comes back as
+    ``set_config_option("project_skills", …)``, so a host must not treat it as a status line it
+    can forget at turn-end. Until answered the repo's skills are simply not loaded, and without
+    this frame no non-interactive surface ever said so.
+    """
+    import acp as _acp
+    update = _acp.update_agent_thought_text("")
+    update.field_meta = {"hermes": {
+        "kind": "project_skills",
+        "state": "untrusted",
+        "root": str(root),
+        "skillCount": int(count),
+        "text": f"这个仓库有 {count} 个项目 skill 未启用（{Path(str(root)).name}）",
+    }}
     return update
 
 
