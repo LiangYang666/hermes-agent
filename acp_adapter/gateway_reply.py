@@ -83,6 +83,12 @@ class GatewayReplyMixin:
         if kind == "reasoning.delta":
             text = _text(payload)
             update = self._chunk(sid, text, thought=True) if text else None
+        elif kind == "status.update":
+            # The owner already publishes the status line it shows its own viewers
+            # (``run_turn_progress._status_callback_sync``); ACP carries it in ``_meta.hermes``.
+            from acp_adapter.events import make_status_update
+            update = make_status_update(payload.get("kind"), payload.get("text"),
+                                        payload.get("items"), payload.get("truncated"))
         else:
             import json
             from acp_adapter.events import _build_plan_update_from_todo_result

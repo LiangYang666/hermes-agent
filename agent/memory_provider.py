@@ -58,6 +58,11 @@ class RecallStatus:
     provider_label: str
     count: int
     glyph: str = INDICATOR_GLYPH
+    # The detail behind the count — ``[{"text": ..., "tags"?: [...], "type"?: str}]``, already capped
+    # by the provider (a status line is not a data channel). Providers that only count leave it None;
+    # a host that does not know the field renders exactly what it rendered before.
+    items: Optional[list[dict[str, Any]]] = None
+    truncated: bool = False
 
 
 # Prompts with no semantic signal; single source of truth for the core prefetch gate and
