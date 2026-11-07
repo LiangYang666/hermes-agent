@@ -100,7 +100,15 @@ def config_options(models: SessionModelState | None, info: dict, mode_id: str) -
                               [(m.model_id, m.name) for m in models.available_models]))
     # ``session.info`` reports the level in force, never ``default`` (a reset session reads the profile's), so
     # ``default`` is offered only while no level is set: a pick never shows as another value than the one chosen.
+    # Only the ladder THIS route takes is advertised. The wide vocabulary (``none``..``ultra``) is the
+    # ENTRY clamp, not a menu: on a route whose wire folds most levels onto one value the extra rows read
+    # as "the setting does nothing" — the 0.22 fork's ``route_offered_efforts`` fix, kept on this path.
     levels = reasoning_choices()[1:]
+    from agent.reasoning_effort import route_offered_efforts
+    offered = route_offered_efforts(info.get("provider"),
+                                    models.current_model_id if models is not None else info.get("model"))
+    if offered:
+        levels = tuple(v for v in levels if v in offered) or levels
     effort = info.get("reasoning_effort") if info.get("reasoning_effort") in levels else "default"
     options.append(select(REASONING_CONFIG_ID, "Reasoning effort", "thought_level", effort,
                           [(v, v) for v in (levels if effort in levels else ("default", *levels))]))

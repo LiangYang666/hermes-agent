@@ -3,20 +3,50 @@ Token Plan flat-token tier with its own key/endpoints — one module per vendor)
 
 Profile names match models.dev catalog keys exactly so model metadata lines up
 and ``model.provider: alibaba-cn`` resolves at runtime.
+
+Thinking on this wire (千问/百炼 docs + live probes, 2026-10-06/07): every DashScope
+OpenAI-compatible profile answers to the SAME two ``extra_body`` parameters, and neither is a
+standard OpenAI field:
+
+``enable_thinking``
+    ``true``/``false``. Qwen 3.8 (``qwen3.8-flash``/``-max``/``-omni-flash``) and DeepSeek V4 both
+    default to thinking ON, so without this parameter the model always reasons — which is exactly
+    the operator's "关掉它，它还是有思考". ``false`` is rejected by thinking-only models (the
+    glm-5.3 series), which is why an unknown family is left untouched below.
+
+``reasoning_effort``
+    The graded knob, with a per-FAMILY vocabulary: Qwen 3.8 takes exactly ``low``/``medium``/
+    ``xhigh``, DeepSeek V4 ``low``..``max``, 阿里云直供 glm-5.2 the full ladder and glm-5.3 exactly
+    ``low``/``high``/``max`` — while Qwen 3.7/3.6/3.5 have no graded knob at all. Sending a level
+    the family does not know is the silent no-op this wiring exists to prevent, so the ladders and
+    the translation (``dashscope_thinking_extras``, shared with the coding-plan tier) both live in
+    ``agent.reasoning_effort``, and a cockpit advertises ``route_offered_efforts`` straight from
+    them.
+
+``thinking_budget`` (never set here)
+    A token cap that is mutually exclusive with ``reasoning_effort`` — the API errors when both
+    arrive. We drive the knob by effort only, so the two can never collide.
 """
 
 from typing import Any
 
-from agent.reasoning_effort import dashscope_preserve_thinking_extras
+from agent.reasoning_effort import dashscope_thinking_extras
 from providers import register_provider
 from providers.base import ProviderProfile
 
 
 class DashScopeProfile(ProviderProfile):
-    """DashScope compatible-mode: ask the server to keep replayed prior-turn reasoning."""
+    """One DashScope OpenAI-compatible endpoint: thinking parameters ride ``extra_body``.
 
-    def build_api_kwargs_extras(self, *, model: str | None = None, **context: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        return dashscope_preserve_thinking_extras(model), {}
+    The translation itself is shared (``agent.reasoning_effort.dashscope_thinking_extras``) because
+    the token-plan and coding-plan tiers are the same wire under a different key/endpoint — one
+    profile per module, one thinking contract for all of them.
+    """
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return dashscope_thinking_extras(reasoning_config, model), {}
 
 
 alibaba = DashScopeProfile(

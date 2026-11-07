@@ -174,6 +174,51 @@ class TestCodexVocabulary:
         assert clamp_effort("ultra", supported) == "max"
 
 
+class TestDashScopeFamilyVocabularies:
+    """DashScope's ladders are per-FAMILY, and this module is where they are pinned."""
+
+    def test_qwen_toggle_only_generations(self):
+        """3.7/3.6/3.5 read no graded knob (live-verified 2026-10-07), so a full ladder here would
+        be picks that fold away on the wire — ``none`` (off) plus one "on" level is the contract."""
+        from agent.reasoning_effort import QWEN_TOGGLE_ONLY_EFFORTS, QWEN38_EFFORTS, route_offered_efforts
+
+        assert QWEN_TOGGLE_ONLY_EFFORTS == ("none", "medium")
+        assert route_offered_efforts("alibaba", "qwen3.7-max") == QWEN_TOGGLE_ONLY_EFFORTS
+        assert route_offered_efforts("alibaba-coding-plan", "qwen3.6-flash") == QWEN_TOGGLE_ONLY_EFFORTS
+        # 3.8 is the generation that DOES have the knob — the catch-all must not swallow it.
+        assert route_offered_efforts("alibaba", "qwen3.8-flash") == QWEN38_EFFORTS
+        assert route_offered_efforts("alibaba", "qwen/qwen3.8-flash") == QWEN38_EFFORTS
+
+    def test_glm53_is_thinking_only_low_high_max(self):
+        """That model always thinks and 400s on ``enable_thinking: false``, so offering "Off"
+        would be a pick that fails the request outright."""
+        from agent.reasoning_effort import DASHSCOPE_GLM53_EFFORTS, route_offered_efforts
+
+        assert DASHSCOPE_GLM53_EFFORTS == ("low", "high", "max")
+        assert route_offered_efforts("alibaba", "glm-5.3") == DASHSCOPE_GLM53_EFFORTS
+        assert "none" not in route_offered_efforts("alibaba", "glm-5.3")
+
+    def test_the_vendor_api_keeps_its_own_glm_ladder(self):
+        """glm-5.x ids are served by 智谱's own API as well, where the vocabulary is narrower — so
+        only a DashScope route may resolve through the host-scoped table."""
+        from agent.reasoning_effort import (
+            DASHSCOPE_GLM53_EFFORTS,
+            OPENAI_COMPAT_WIRE_EFFORTS,
+            route_offered_efforts,
+        )
+
+        assert route_offered_efforts("zai", "glm-5.3") == OPENAI_COMPAT_WIRE_EFFORTS
+        assert route_offered_efforts("zai", "glm-5.3") != DASHSCOPE_GLM53_EFFORTS
+
+    def test_coding_plan_advertises_like_the_alibaba_profiles(self):
+        """One wire, one advertised ladder: the tiers differ by key/endpoint, not by contract."""
+        from agent.reasoning_effort import route_offered_efforts
+
+        for model in ("qwen3.8-flash", "deepseek-v4.1-flash", "glm-5.2", "glm-5.3", "qwen3.7-max"):
+            assert route_offered_efforts(
+                "alibaba-coding-plan", model) == route_offered_efforts("alibaba", model), model
+
+
 class TestRequestedEffort:
     def test_extracts_effort(self):
         assert requested_effort({"enabled": True, "effort": "High"}) == "high"
