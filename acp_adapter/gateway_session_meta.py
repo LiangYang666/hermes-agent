@@ -71,6 +71,10 @@ def session_modes(info: dict | None = None) -> SessionModeState:
 
 REASONING_CONFIG_ID = "reasoning_effort"
 SERVICE_TIER_CONFIG_ID = "service_tier"
+CONTEXT_BUDGET_CONFIG_ID = "context_budget"
+# The presets a cockpit shows; anything else is still accepted (the operator may type a number), so
+# the list is a shortcut, not a closed set.
+CONTEXT_BUDGET_PRESETS = (262_144, 524_288, 786_432, 1_048_576)
 SERVICE_TIER_LABELS = {"normal": "Normal", "fast": "Fast", "auto": "Auto", "cold": "Cold", "ultrafast": "Ultrafast"}
 
 
@@ -97,6 +101,17 @@ def config_options(models: SessionModelState | None, info: dict, mode_id: str) -
     effort = info.get("reasoning_effort") if info.get("reasoning_effort") in levels else "default"
     options.append(select(REASONING_CONFIG_ID, "Reasoning effort", "thought_level", effort,
                           [(v, v) for v in (levels if effort in levels else ("default", *levels))]))
+    # The session's context budget: a ``model.context_length`` pin frozen into THIS session's policy
+    # (gateway/session_mutation_policy.py), so a slot's cap never rewrites the profile's own pin.
+    # Advertised as a select because ACP has no number field; a value outside the presets still
+    # applies — it simply shows up as its own row (the 0.22 fork's free-form behaviour, kept).
+    budget = info.get("context_length")
+    budget_current = str(budget) if isinstance(budget, int) and budget > 0 else "auto"
+    budget_rows = [("auto", "Auto (the model's own window)")]
+    budget_rows += [(str(tokens), f"{tokens // 1024}K") for tokens in CONTEXT_BUDGET_PRESETS]
+    if budget_current != "auto" and budget_current not in {value for value, _ in budget_rows}:
+        budget_rows.append((budget_current, f"{budget_current} (custom)"))
+    options.append(select(CONTEXT_BUDGET_CONFIG_ID, "Context budget", "other", budget_current, budget_rows))
     return options
 
 

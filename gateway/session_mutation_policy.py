@@ -68,4 +68,72 @@ async def prepare_edit_policy(authority, live, payload, prepared):
     return _rebind(authority, prepared, old, replace(old, edit_approval_policy=payload['policy']))
 
 
-PREPARE = {'reasoning': prepare_reasoning, 'workspace': prepare_workspace, 'edit_policy': prepare_edit_policy}
+async def prepare_context_budget(authority, live, payload, prepared):
+    """The session's context budget: a ``model.context_length`` pin inside the frozen policy config.
+
+    Session-scoped on purpose — the profile's own pin (``hermes config set model.context_length``)
+    is what every other session reads, and a cockpit slot adjusting its budget must not rewrite it.
+    ``tokens=None`` drops the pin, handing the window back to the model's own.
+    """
+    from gateway.session_policy import restore_policy
+    old = restore_policy(prepared['snapshot']['receipt']['policy'])
+    frozen = old.config()
+    tokens = payload['tokens']
+    model_cfg = frozen.get('model')
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    current = model_cfg.get('context_length')
+    changed = current != tokens
+    if changed:
+        if tokens is None:
+            model_cfg.pop('context_length', None)
+        else:
+            model_cfg['context_length'] = tokens
+            frozen['model'] = model_cfg
+    # Applied even when the frozen value already matches: the picker can be re-stated over a live
+    # agent that was constructed before this pin existed (a session carried over from an older build),
+    # and re-pointing the compressor is idempotent.
+    await asyncio.to_thread(_apply_context_budget_live, authority, prepared['snapshot']['receipt']['session_id'],
+                            tokens)
+    if not changed:
+        return {'status': 'noop', 'context_length': tokens}
+    return _rebind(authority, prepared, old, replace(old, config_json=json.dumps(frozen)))
+
+
+def _apply_context_budget_live(authority, session_id, tokens) -> None:
+    """Push the ceiling into the session's running agent, if this session has one.
+
+    ``model.context_length`` is read ONCE, at construction: the frozen policy above governs the next
+    agent this session launches, but a picker change must not look applied while the live turn keeps
+    compressing against the old window. Mirrors the model-switch path (``_update_switch_compressor``):
+    cache the pin on the agent, re-resolve the window, re-point the compressor, re-check feasibility.
+    """
+    from gateway.session_contract import SessionRef
+    try:
+        # A resident agent is re-pointed; a cold session has none, and its next agent is constructed
+        # from the frozen policy (``session_context_pin``), so there is nothing to do here.
+        agent = authority.agent(SessionRef(authority.profile_id, session_id))
+    except Exception:
+        return
+    if agent is None:
+        return
+    from agent.agent_init import set_config_context_length
+    from agent.model_metadata import get_model_context_length
+    set_config_context_length(agent, tokens)
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+        custom_providers = get_compatible_custom_providers(load_config())
+    except Exception:
+        custom_providers = None
+    api_key = agent.api_key if isinstance(agent.api_key, str) else ''
+    window = get_model_context_length(agent.model, base_url=agent.base_url, api_key=api_key,
+                                      provider=agent.provider, config_context_length=tokens,
+                                      custom_providers=custom_providers)
+    agent.context_compressor.update_model(model=agent.model, context_length=window, base_url=agent.base_url,
+                                          api_key=agent.api_key, provider=agent.provider, api_mode=agent.api_mode)
+    from agent.conversation_compression_feasibility import revalidate_compression_feasibility
+    revalidate_compression_feasibility(agent)
+
+
+PREPARE = {'reasoning': prepare_reasoning, 'workspace': prepare_workspace, 'edit_policy': prepare_edit_policy,
+           'context_budget': prepare_context_budget}

@@ -214,11 +214,23 @@ class LocalSessionPolicy:
                     config[key] = live[key]
                 else:
                     config.pop(key, None)
+            # The context budget is the SESSION's own, even when the model block follows the profile:
+            # ``model`` is a followed section, so a straight replacement above would drop a slot's
+            # ceiling and silently hand the turn back the model's whole window (and the profile's pin,
+            # which is a different decision, must not leak in the other direction either).
             if held:
                 config['model'] = _held_pick(frozen, config.get('model') or {})
             else:
                 from gateway.run import _resolve_gateway_model
                 model = _resolve_gateway_model(live) or self.model
+            if isinstance(frozen, dict):
+                budget = frozen.get('context_length')
+                if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+                    followed_model = config.get('model')
+                    if not isinstance(followed_model, dict):
+                        followed_model = {}
+                    followed_model['context_length'] = budget
+                    config['model'] = followed_model
             agent, live_agent = config.setdefault('agent', {}), live.get('agent') or {}
             for key in FOLLOW_AGENT_KEYS:
                 if key in pinned:
@@ -1220,3 +1232,19 @@ def active_policy():
     """The frozen launch policy of the turn executing in this context, or ``None`` (standalone
     serve / messaging turns). Consumers read it instead of re-deriving from live config."""
     return _ACTIVE_POLICY.get()
+
+
+def session_context_pin():
+    """The active session's own ``model.context_length`` budget, or ``None`` outside a gateway turn.
+
+    A gateway turn runs on the owning profile's config; a cockpit slot's ceiling is a field of its
+    frozen launch policy, so this is the one place a session-scoped pin is read from (agent_init's
+    construction included — the display, the compressor and the switch/fallback re-resolutions all
+    derive from the value cached there).
+    """
+    policy = active_policy()
+    if policy is None:
+        return None
+    model = (policy.config() or {}).get('model')
+    pin = model.get('context_length') if isinstance(model, dict) else None
+    return pin if isinstance(pin, int) and not isinstance(pin, bool) and pin > 0 else None

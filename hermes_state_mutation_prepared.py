@@ -110,9 +110,18 @@ def edit_policy_in_transaction(db, conn, session_id, payload, prepared):
                                               'execution_generation': generation}
 
 
+def context_budget_in_transaction(db, conn, session_id, payload, prepared):
+    """The context pin lives in the frozen policy config (``model.context_length``), so the store
+    only commits the policy and reports what the next turn will be capped at."""
+    snapshot, generation = _commit_policy(db, conn, session_id, prepared)
+    return {session_id, snapshot['target']}, {'context_length': payload['tokens'],
+                                              'execution_generation': generation}
+
+
 POLICY_HANDLERS = {'model': model_in_transaction, 'reasoning': reasoning_in_transaction,
                    'workspace': workspace_in_transaction, 'editor_mcp': editor_mcp_in_transaction,
-                   'edit_policy': edit_policy_in_transaction}
+                   'edit_policy': edit_policy_in_transaction,
+                   'context_budget': context_budget_in_transaction}
 
 
 _RECEIPTS = "FROM state_meta WHERE key GLOB 'gateway.mutation.v1.*' AND json_valid(value) "

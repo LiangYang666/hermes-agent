@@ -492,6 +492,17 @@ def local_session_info(authority, ref):
         if warning := ' '.join(filter(None, notices)):
             info['config_warning'] = warning
     info.update(_classic_cli_fields(authority, ref, live, agent, policy))
+    # The session's context-budget pin (``model.context_length`` in its frozen policy). Every ACP
+    # editor keeps a context-budget picker; a viewer that cannot see the current value would show
+    # 「auto」 over a capped session. Read from the policy config, never from the process config.
+    if policy is not None:
+        import json as _json
+        try:
+            pin = (_json.loads(policy.config_json).get('model') or {}).get('context_length')
+        except Exception:
+            pin = None
+        if isinstance(pin, int) and pin > 0:
+            info['context_length'] = pin
     return info
 
 

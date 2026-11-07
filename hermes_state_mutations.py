@@ -35,6 +35,12 @@ def validate_action(operation, payload):
     if (operation == 'edit_policy' and set(payload) == {'policy'} and isinstance(payload['policy'], str)
             and payload['policy'] in {'ask', 'workspace_session', 'session'}):
         return
+    # A session's context budget (gateway/session_mutation_policy.py prepare_context_budget): the
+    # ``model.context_length`` pin, scoped to this session. ``None`` = back to the model's own window.
+    if operation == 'context_budget' and set(payload) == {'tokens'}:
+        tokens = payload['tokens']
+        if tokens is None or (type(tokens) is int and tokens > 0):
+            return
     if operation == 'compress' and _valid_compress_payload(payload):
         return
     if operation in {'delete', 'reset'} and not payload:
@@ -90,7 +96,7 @@ def apply_action(db, conn, session_id, operation, payload, *, prepared=None):
     if operation == 'compress':
         from hermes_state_mutation_compress import compress_in_transaction
         return compress_in_transaction(db, conn, session_id, payload, prepared)
-    if operation in {'model', 'reasoning', 'workspace', 'editor_mcp', 'edit_policy'}:
+    if operation in {'model', 'reasoning', 'workspace', 'editor_mcp', 'edit_policy', 'context_budget'}:
         from hermes_state_mutation_prepared import POLICY_HANDLERS
         return POLICY_HANDLERS[operation](db, conn, session_id, payload, prepared)
     if operation == 'branch':
