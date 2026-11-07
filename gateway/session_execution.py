@@ -158,10 +158,19 @@ class GatewaySessionAgentMixin:
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
         policy = policy_for_source(runner, src)
+        # A BYSTANDER session (a cockpit's observer, #76 D) watches another session for a few minutes
+        # and says one sentence: long-term recall is re-read on every beat (pure cost, and it drags
+        # the wording toward whatever was recalled), and the background self-review runs
+        # `skill_view`/`skill_manage` — i.e. WRITES — on the operator's tab. Both off, this session
+        # only: the owner serves everyone else from the same config.
+        observer = bool(policy and policy.observer)
+        disabled_toolsets = ctx.disabled_toolsets
+        if observer:
+            disabled_toolsets = tuple(sorted({*(disabled_toolsets or ()), 'memory'}))
         return ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
-            enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
+            enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
             prefill_messages=(session_prefill(active_authority(runner), policy, src.chat_id) if policy
                               else runner._prefill_messages) or None,
@@ -181,7 +190,8 @@ class GatewaySessionAgentMixin:
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=not bool(policy and policy.ignore_rules),
-            skip_memory=bool(policy and policy.ignore_rules),
+            skip_memory=bool(policy and (policy.ignore_rules or policy.observer)),
+            skip_background_review=observer,
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.

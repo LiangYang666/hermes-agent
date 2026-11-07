@@ -16,7 +16,8 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
-                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env'})
+                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
+                           'observer'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -166,6 +167,10 @@ class LocalSessionPolicy:
     # An ACP session's edit approval (``session.mutate edit_policy``; main's ACP modes): ``ask`` (Default),
     # ``workspace_session`` (Accept Edits) or ``session`` (Don't Ask). Sensitive paths always ask.
     edit_approval_policy: str = 'ask'
+    # A BYSTANDER session (a cockpit's observer that watches another session and says one sentence):
+    # no memory recall, no background self-review, no memory-writing toolset. Per session because the
+    # cockpit spawns one ACP viewer per session and the owner is shared by everyone else (#76 D).
+    observer: bool = False
 
     def client_env(self):
         return None if self.client_env_json is None else json.loads(self.client_env_json)
@@ -445,6 +450,8 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
     bad_bypass = next((name for name in BYPASS_FIELDS if name in params and type(params[name]) is not bool), None)
     if bad_bypass:
         _refuse(bad_bypass, 'must be a boolean')
+    if 'observer' in params and type(params['observer']) is not bool:
+        _refuse('observer', 'must be a boolean')
     safe_mode = params.get('safe_mode', False)
     ignore_user_config = safe_mode or params.get('ignore_user_config', False)
     if 'api_key' in params and (not isinstance(params['api_key'], str) or not params['api_key'].strip()):
@@ -503,7 +510,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
                               safe_mode=safe_mode, ignore_user_config=ignore_user_config,
                               coding_posture=coding_posture, client_env_json=client_env,
                               client_env_remote=client_env is not None and not client_local,
-                              client_env_rules_json=rules)
+                              client_env_rules_json=rules, observer=params.get('observer') is True)
 
 
 def terminal_uses_host_cwd(terminal):
@@ -999,7 +1006,10 @@ def route_launch_key(authority, policy, config):
 def restore_policy(data):
     """Reject incomplete private policy rather than rebuilding from current defaults."""
     try:
-        policy = LocalSessionPolicy(**data)
+        # Unknown keys are the forward case (a field a newer owner wrote this owner does not know):
+        # drop them rather than refuse a whole session, and let the checks below judge the rest.
+        known = {name for name in LocalSessionPolicy.__dataclass_fields__}
+        policy = LocalSessionPolicy(**{k: v for k, v in data.items() if k in known})
         from gateway.session_a2a import is_forward_policy
         surfaces = {**SURFACES, 'cron': 'cron', 'kanban': 'cli', 'bot_room': 'bot_room'}
         if ((not is_forward_policy(policy) and
@@ -1013,6 +1023,7 @@ def restore_policy(data):
                 or type(policy.coding_posture) is not bool
                 or not _valid_client_env(policy.client_env_json) or type(policy.client_env_remote) is not bool
                 or not _valid_client_env(policy.client_env_rules_json, list)
+                or type(policy.observer) is not bool
                 or policy.edit_approval_policy not in EDIT_APPROVAL_POLICIES
                 or (policy.edit_approval_policy != 'ask' and policy.source != 'acp')
                 or (policy.safe_mode and not policy.ignore_user_config)):
