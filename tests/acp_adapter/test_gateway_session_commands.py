@@ -183,6 +183,29 @@ async def test_the_editors_own_pick_projected_before_the_mutation_answers_is_har
 
 
 @pytest.mark.asyncio
+async def test_the_owners_echo_after_the_mutation_answers_still_reaches_the_editor():
+    """The owner publishes ``session.info`` on its event stream, so the echo can land AFTER
+    ``session.mutate`` answers. Writing the target into ``_modes`` inside the pick made that echo look
+    like "no change" and it was never sent: the editor stayed on the old mode while the receipt said
+    the new one — #95, where 226 of 227 receipts said ``ask`` under a cockpit full of ``dont_ask``."""
+    async def rpc(method, **params):
+        if method == 'session.resume':
+            return {'revision': 3, 'execution_generation': 7}
+        return {'session_id': 's', 'operation': 'edit_policy', 'revision': 4,
+                'edit_approval_policy': params['payload']['policy']}
+
+    agent = _agent(rpc)
+    agent._modes['s'] = 'default'
+    await agent.set_session_mode('dont_ask', 's')
+    assert agent._modes['s'] == 'default', 'the pick must not pre-write the mode the owner has not echoed'
+    await agent._project({'session_id': 's', 'type': 'session.info',
+                          'payload': {'edit_approval_policy': 'session'}})
+    shown = [call.kwargs['update'] for call in agent._conn.session_update.await_args_list]
+    assert [(u.session_update, u.current_mode_id) for u in shown] == [('current_mode_update', 'dont_ask')], shown
+    assert agent._modes['s'] == 'dont_ask'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('pick', [lambda a: a.set_session_mode('dont_ask', 's'),
                                   lambda a: a.set_config_option('edit_approval_policy', 's', 'session')])
 async def test_a_mode_pick_during_a_turn_is_refused_with_the_reason(pick):
