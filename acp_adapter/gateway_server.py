@@ -681,9 +681,13 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
     async def _set_edit_policy(self, session_id, policy):
         """The owner's ``edit_policy`` mutation; every surface attached to the session reads the
         committed policy from ``session.info``."""
-        from acp_adapter.modes import EDIT_APPROVAL_POLICY_TO_MODE
         await self._idle_control(session_id, "edit_policy", {"policy": policy}, "Mode")
-        self._modes[session_id] = EDIT_APPROVAL_POLICY_TO_MODE[policy]
+        # NOT recorded here. ``_modes`` is exactly what ``_project_mode`` compares the owner's
+        # ``session.info`` against, so writing the target now makes the owner's own echo look like
+        # "nothing changed" and it is never sent — leaving the editor on the old mode while the
+        # receipt says the new one. ``SetSessionModeResponse`` carries no state, so that echo is the
+        # only read-back an ACP client has (#95: 226/227 receipts said ``ask`` while every cockpit
+        # row drew ``dont_ask``). The projection below records it, on the owner's word.
 
     async def _idle_control(self, session_id, operation, payload, label):
         """A revision-fenced owner mutation that applies to idle sessions only, like a model pick."""
