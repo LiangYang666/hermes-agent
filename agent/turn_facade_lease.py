@@ -30,6 +30,57 @@ _REFRESH_WRITE_PATIENCE_S = 20.0
 # Headroom before expiry for one BEGIN IMMEDIATE blocked in the writer's 1s busy handler, plus jitter.
 _REFRESH_EXPIRY_MARGIN_S = 2.0
 
+# Leases whose turn is in flight right now. A process that is SIGTERM'd mid-turn (an editor
+# stopping `hermes acp`, a promote restart, a crash handler) never reaches ``release()``, so the
+# row outlives the turn and every resume answers ``session_busy`` until the TTL lapses — 841 s in
+# the incident this guards. The exit hook deletes those rows first.
+_LIVE_LEASES: "set[DurableTurnLease]" = set()
+_SHUTDOWN_HOOKS_INSTALLED = False
+_SHUTDOWN_LOCK = threading.RLock()
+
+
+def release_live_leases_on_shutdown() -> int:
+    """Delete the rows of every in-flight turn here; returns how many were released.
+
+    Idempotent and safe to call from a signal handler: a failure to write (busy database,
+    closed connection) is logged and left to TTL expiry rather than raised into the exit.
+    """
+    with _SHUTDOWN_LOCK:
+        leases = list(_LIVE_LEASES)
+        _LIVE_LEASES.clear()
+    for lease in leases:
+        try:
+            lease.release()
+        except Exception:  # noqa: BLE001 — an exit path must not raise
+            logger.error("Failed to release session turn lease on shutdown: %s",
+                         getattr(lease, "session_id", "?"), exc_info=True)
+    return len(leases)
+
+
+def _install_shutdown_hooks() -> None:
+    """Arrange for the exit path to release the lease. Once per process, never clobbering a
+    handler somebody else installed (the CLI owns SIGTERM on some paths)."""
+    global _SHUTDOWN_HOOKS_INSTALLED
+    with _SHUTDOWN_LOCK:
+        if _SHUTDOWN_HOOKS_INSTALLED:
+            return
+        _SHUTDOWN_HOOKS_INSTALLED = True
+    import atexit
+    import signal
+
+    atexit.register(release_live_leases_on_shutdown)
+    try:
+        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            def _on_sigterm(signum, _frame):
+                release_live_leases_on_shutdown()
+                # Restore the default disposition and re-raise so the exit code still reports
+                # "terminated by SIGTERM" to whoever is watching (launchd, an editor).
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):  # not the main thread / no signal support
+        pass
+
 
 class DurableTurnLease:
     """An admitted session turn lease plus the periodic timers that keep it alive and watch the turn.
@@ -83,6 +134,11 @@ class DurableTurnLease:
     def start(self) -> None:
         with self._lock:
             self.turn_active = True
+        # Registered before anything can fail: the exit hook is what keeps a killed turn from
+        # leaving its row behind (see ``release_live_leases_on_shutdown``).
+        with _SHUTDOWN_LOCK:
+            _LIVE_LEASES.add(self)
+        _install_shutdown_hooks()
         # Stamp the activity clock at turn entry: `_last_activity_ts` persists across turns, so
         # without this the watchdog would measure idle from the PREVIOUS turn and abort a fresh one.
         self.agent._touch_activity("starting new turn")
@@ -115,6 +171,8 @@ class DurableTurnLease:
     def release(self) -> None:
         """Release the row and drop the agent's holder attrs (only if they still name this lease)."""
         agent = self.agent
+        with _SHUTDOWN_LOCK:
+            _LIVE_LEASES.discard(self)
         try:
             self.db.release_session_turn_lease(self.session_id, self.holder)
         except Exception:

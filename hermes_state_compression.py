@@ -841,6 +841,62 @@ class SessionCompressionMixin:
                 (conversation_id, holder))
         self._execute_write(_do)
 
+    def release_orphan_turn_lease(
+        self, session_id: str, *, active_holder: Optional[str] = None,
+        evidence: Optional[str] = None, now: Optional[float] = None,
+        patience_s: Optional[float] = None,
+    ) -> Optional[str]:
+        """Release a conversation's turn lease early, but only when the turn behind it is gone.
+
+        A turn stamps its lease on entry and deletes it on exit. A process killed
+        mid-turn — an editor's SIGTERM of ``hermes acp``, a promote restart, a crash —
+        never reaches the exit, so the row outlives the turn: every resume answers
+        ``session_busy`` until the TTL lapses (841 s observed). Reclaiming the row is
+        also how an unobserved turn gets stopped: its next refresh finds nothing to
+        renew, and a failed refresh interrupts the turn that thought it owned it.
+
+        Releases on ``expired`` (``expires_at`` has passed), ``holder_dead`` (the
+        holder's local PID is provably gone), or caller proof — ``evidence`` is
+        ``"detached"`` (the turn's ACP client is gone) or ``"aborted"`` (the turn
+        itself was cancelled) and is the only thing that may release a live holder.
+
+        Keeps the row when it names ``active_holder`` (this process's own in-flight
+        turn), when the holder's PID namespace cannot be probed (reclaimed PIDs must
+        never steal a live lease), and when the conversation has no row at all.
+
+        Returns the reason it released, or None when it kept the row.
+        """
+        if not session_id:
+            return None
+        # Imported here: hermes_state builds this mixin and importing it at module
+        # scope would be a cycle. Same call the acquire predicate makes.
+        from hermes_state import _compression_lock_holder_process_is_dead
+        proof = evidence if evidence in ("detached", "aborted") else None
+        stamp = time.time() if now is None else float(now)
+        def _do(conn):
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+                (conversation_id,)).fetchone()
+            if not row:
+                return None
+            holder, expires_at = str(row[0] or ""), float(row[1] or 0.0)
+            if active_holder and holder == active_holder:
+                return None
+            if expires_at <= stamp:
+                reason = "expired"
+            elif _compression_lock_holder_process_is_dead(holder):
+                reason = "holder_dead"
+            elif proof:
+                reason = proof
+            else:
+                return None
+            conn.execute(
+                "DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
+                (conversation_id, holder))
+            return reason
+        return self._execute_write(_do, patience_s=patience_s)
+
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Current (non-expired) holder for ``session_id``, or None. Diagnostic only."""
         if not session_id:
