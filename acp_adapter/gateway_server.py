@@ -104,6 +104,13 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # never arrived. The editor's retry (that session's next prompt, same content) reuses it, so the authority
         # returns the same admission.
         self._unacked = {}
+        # 子代理的生命周期（issue #97）。上游把 `subagent.*` 只发给 gateway 自己的事件流，ACP 侧一条都不
+        # 投影 —— 于是任何 ACP 客户端（本驾驶舱、Zed…）都看不到「派出去的子代理还在跑 / 跑完了成没成」。
+        # 这里按会话维持两张表：owner 最近一帧 background.tasks 的进程行，以及本适配层自己攒出来的
+        # 子代理行。两张表合成一帧发出去，形状与 `background.tasks` 完全一致（`kind: "delegation"`），
+        # 客户端不必学第二种词汇，也就不会漏掉其中一类。
+        self._bg_rows = {}
+        self._subagents = {}
         # Admissions whose terminal reply one path (the pump's message.complete or a retry's
         # terminal receipt) is delivering right now; the other path yields to the claim.
         self._settling = set()
@@ -1056,6 +1063,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             return
         if kind in {"reasoning.delta", "todo.updated", "status.update", "background.tasks"}:
             await self._project_side_update(kind, sid, editor_id, payload)
+            return
+        if isinstance(kind, str) and kind.startswith("subagent."):
+            # 子代理（issue #97）：上游只把它发给自己的事件流，ACP 侧原本一条都不投影。见
+            # `_project_subagent` —— 它把生命周期翻成与 background.tasks 同形状的帧。
+            await self._project_subagent(kind, sid, editor_id, payload)
             return
         if kind in {"tool.start", "tool.complete"}:
             await self._project_tool(kind, sid, editor_id, aid, payload)
