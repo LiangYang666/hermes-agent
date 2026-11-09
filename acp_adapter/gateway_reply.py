@@ -73,6 +73,61 @@ class GatewayReplyMixin:
         if (ids := self._message_ids.get(sid)) is not None:
             ids.close()
 
+    def _merged_background(self, sid):
+        """这个会话要发的后台行：owner 的进程行 + 本适配层攒的子代理行（#97）。"""
+        rows = list(self._bg_rows.get(sid) or [])
+        rows.extend((self._subagents.get(sid) or {}).values())
+        return rows
+
+    async def _project_subagent(self, kind, sid, editor_id, payload):
+        """`subagent.*` → 与 `background.tasks` 同形状的一行（issue #97）。
+
+        上游把子代理的生命周期只发给自己的事件流（`gateway/local_viewer_events._publish_subagent`），
+        ACP 侧原先一条都不投影：驾驶舱因此只能看见 shell 进程，看不见被派出去的子代理 —— 而它从前
+        是有的。这里按 `subagent_id` 攒一张表，翻成 `kind: "delegation"` 的行（`command` 放目标，
+        `exitCode` 由结束状态判定），每来一条就重发整张表，客户端照旧整表替换。
+        """
+        sub_id = payload.get("subagent_id")
+        if not isinstance(sub_id, str) or not sub_id:
+            return
+        # Only the three lifecycle beats. `subagent.progress` / `.thinking` / `.text` are per-line
+        # narration: one whole-table frame each would be a flood, and none of them changes a row.
+        if kind not in {"subagent.spawn_requested", "subagent.start", "subagent.complete"}:
+            return
+        roster = self._subagents.setdefault(sid, {})
+        prev = roster.get(sub_id) or {}
+        goal = payload.get("goal") or prev.get("command") or sub_id
+        count = payload.get("task_count")
+        row = {
+            "id": f"subagent:{sub_id}",
+            "command": str(goal)[:200],
+            "pid": None,
+            "kind": "delegation",
+            # A delegation always owes the session a wake-up: the child's report comes back as a turn.
+            "notifyOnComplete": True,
+            "status": "running",
+            "uptimeSeconds": prev.get("uptimeSeconds") or 0,
+            "exitCode": None,
+            "taskCount": count if isinstance(count, int) and count > 0 else prev.get("taskCount") or 1,
+            "phase": "running",
+        }
+        if kind == "subagent.complete":
+            status = str(payload.get("status") or "")
+            duration = payload.get("duration_seconds")
+            row["status"] = "exited"
+            # 失败状态就三个（SUBAGENT_FAILURE_STATUSES）；其余（completed 等）算成功。三态里的
+            # 「没报」在这里不会出现 —— complete 一定带 status，缺了按成功处理会撒谎，所以给 1。
+            row["exitCode"] = 1 if status in {"failed", "error", "timeout"} or not status else 0
+            row["phase"] = status or "completed"
+            if isinstance(duration, (int, float)) and duration >= 0:
+                row["uptimeSeconds"] = int(duration)
+        roster[sub_id] = row
+        if self._conn:
+            from acp_adapter.events import make_background_update
+            await self._conn.session_update(
+                session_id=editor_id, update=make_background_update(self._merged_background(sid)),
+            )
+
     async def _project_side_update(self, kind, sid, editor_id, payload):
         """Turn events outside the reply text, as the in-process server projected them.
 
@@ -88,7 +143,10 @@ class GatewayReplyMixin:
             update = self._chunk(sid, text, thought=True) if text else None
         elif kind == "background.tasks":
             from acp_adapter.events import make_background_update
-            update = make_background_update(payload.get("tasks"))
+            # 进程行换成 owner 这一帧的内容，子代理行留着（#97）：两套词汇合成同一个形状，否则后到的
+            # 进程快照会把子代理那几行整片盖掉 —— 而它们本来是同一个问题的两个答案。
+            self._bg_rows[sid] = payload.get("tasks") or []
+            update = make_background_update(self._merged_background(sid))
         elif kind == "status.update":
             # The owner already publishes the status line it shows its own viewers
             # (``run_turn_progress._status_callback_sync``); ACP carries it in ``_meta.hermes``.
