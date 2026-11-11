@@ -114,6 +114,14 @@ DASHSCOPE_GLM53_EFFORTS: tuple[str, ...] = ("low", "high", "max")
 #: level or the operator cannot turn thinking off at all.
 DEEPSEEK_ROUTE_EFFORTS: tuple[str, ...] = ("none",) + DEEPSEEK_V4_EFFORTS
 
+#: Xiaomi MiMo (``api.xiaomimimo.com``). Probe 2026-11-11 against ``mimo-v2.6-flash``: the wire
+#: takes exactly ``none``/``low``/``medium``/``high`` and answers ``minimal`` with HTTP 400
+#: ("reasoning_effort must be one of 'none', 'low', 'medium' or 'high'"). ``none`` really is the
+#: off switch (2 completion tokens, no reasoning preamble), and an ``extra_body.thinking`` toggle
+#: works beside it. Thinking defaults ON when nothing is sent, which is why an ignored toggle reads
+#: as "the effort setting does nothing" (#100).
+MIMO_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high")
+
 #: Provider profile names (and their documented aliases) → the levels their wire really accepts.
 #: Anything absent keeps the widest OpenAI-compatible vocabulary above: a route we have not
 #: verified must not have choices taken away from it, and it clamps again downstream anyway.
@@ -121,6 +129,9 @@ _ROUTE_EFFORTS: dict[str, tuple[str, ...]] = {
     "deepseek": DEEPSEEK_ROUTE_EFFORTS,
     "deep-seek": DEEPSEEK_ROUTE_EFFORTS,
     "deepseek-chat": DEEPSEEK_ROUTE_EFFORTS,
+    "xiaomi": MIMO_EFFORTS,
+    "mimo": MIMO_EFFORTS,
+    "xiaomi-mimo": MIMO_EFFORTS,
     "alibaba": QWEN38_EFFORTS,
     "alibaba-cn": QWEN38_EFFORTS,
     "alibaba-cloud": QWEN38_EFFORTS,
