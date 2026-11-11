@@ -30,6 +30,46 @@ def _translate_acp_cwd(cwd: str) -> str:
     return translate_cwd_for_wsl_backend(str(cwd))
 
 
+def _decode_config_model(
+    raw_model: str | None, *, config_provider: str | None = None,
+    user_providers: dict | None = None, custom_providers: list | None = None,
+) -> tuple[str, str | None]:
+    """Split a qualified config default (``xiaomi:mimo-v2.6-flash``) into (model, provider).
+
+    ``model.default`` is written by hand, by ``hermes config set``, and by Agentus. The qualified
+    ``provider:model`` form is legal — it is exactly what ``-m`` and ``/model`` accept and what
+    ``parse_model_input`` decodes — but this resolver used to hand the whole string to the
+    configured ``model.provider`` as a model id, so the session came up as
+    ``deepseek:xiaomi:mimo-v2.6-flash`` and every turn 400'd on the upstream's model whitelist
+    (#102). Same owner as the CLI/TUI/oneshot startup paths, so a default that names its own
+    provider wins over a stale ``model.provider`` here too.
+
+    Returns the input untouched when there is nothing to decode (plain ids, aggregator-native
+    slugs, unknown prefixes).
+    """
+    raw = (raw_model or "").strip()
+    if not raw:
+        return raw_model or "", config_provider
+    try:
+        from hermes_cli.model_switch import resolve_startup_model_route
+
+        route = resolve_startup_model_route(
+            raw, current_provider=str(config_provider or ""),
+            user_providers=user_providers or None, custom_providers=custom_providers or None)
+    except Exception:
+        logger.debug("ACP: config model %r left undecoded", raw, exc_info=True)
+        return raw, config_provider
+    if route is None or not route.model:
+        return raw, config_provider
+    if route.provider and config_provider and route.provider != str(config_provider):
+        # Both halves are explicit and disagree. Honour the prefix (as every other startup path
+        # does) but say so loudly — the alternative is the silent 400 this decode exists to stop.
+        logger.warning(
+            "ACP: model.default %r names provider %r while model.provider is %r — routing to %r",
+            raw, route.provider, config_provider, route.provider)
+    return route.model, (route.provider or config_provider)
+
+
 def _normalize_cwd_for_compare(cwd: str | None) -> str:
     expanded = os.path.expanduser(str(cwd or ".").strip() or ".")
 
@@ -515,6 +555,12 @@ class SessionManager:
         elif isinstance(model_cfg, str):
             default_model = model_cfg.strip()
 
+        # Whatever is in play (an explicit picker model, else the configured default) may be a
+        # qualified ``provider:model`` string — see ``_decode_config_model`` (#102).
+        resolved_model, config_provider = _decode_config_model(
+            model or default_model, config_provider=config_provider,
+            user_providers=config.get("providers"), custom_providers=config.get("custom_providers"))
+
         if enabled_toolsets is None:
             # The same per-platform resolver as the gateway/cron/api_server: platform_toolsets.acp wins, else
             # hermes-acp; its MCP half (every enabled server, a listed-name allowlist, or none for ``no_mcp``)
@@ -528,17 +574,17 @@ class SessionManager:
             # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
             "disabled_toolsets": (list(disabled_toolsets) if disabled_toolsets is not None
                                   else parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) or None),
-            "model": model or default_model,
+            "model": resolved_model,
             "cwd": cwd,
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never
             # reaches an ACP session and the transport applies its default effort (a 400 on non-reasoning
             # models). Resolved against the session's model so per-model overrides apply.
-            "reasoning_config": resolve_reasoning_config(config, model or default_model),
+            "reasoning_config": resolve_reasoning_config(config, resolved_model),
         }
         resolve_error: Exception | None = None
         try:
             runtime = resolve_runtime_provider(
-                requested=requested_provider or config_provider, target_model=(model or default_model) or None)
+                requested=requested_provider or config_provider, target_model=resolved_model or None)
             kwargs.update({
                 "provider": runtime.get("provider"), "api_mode": api_mode or runtime.get("api_mode"),
                 "base_url": base_url or runtime.get("base_url"), "api_key": runtime.get("api_key"),
