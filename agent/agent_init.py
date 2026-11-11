@@ -1741,6 +1741,7 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     # The context budget is the SESSION's own. A gateway turn's config is the owning profile's, so a
     # cockpit slot's ceiling lives on its launch policy instead: take ``model.context_length`` from
     # there when the session pinned one (a plain CLI run has no active policy and reads the config).
+    _session_pin = None
     with suppress(Exception):
         from gateway.session_policy import session_context_pin
         _session_pin = session_context_pin()
@@ -1774,6 +1775,13 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
         _config_context_length = _scope_context_length_to_default_runtime(
             agent, _agent_cfg, _model_section, _custom_providers, _config_context_length, base_url
         )
+    if _session_pin is not None:
+        # The SESSION's pin describes the route this session runs, which is routinely NOT the
+        # profile's default model (a cockpit slot picks its own). The scoping above exists for the
+        # profile's pin — "a --model launch must not inherit the default's window" — so it must not
+        # discard the session's: doing so handed the turn the model's whole window and a 512K budget
+        # never compressed (#101).
+        _config_context_length = _session_pin
 
     # Reused by _check_compression_model_feasibility (aux compression model detection).
     agent._custom_providers = _custom_providers
