@@ -513,24 +513,28 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         to the SESSION, not to whoever happened to submit the prompt, so returning silently here
         left the cockpit reporting a stop that never happened (issue #108).
 
-        The generation comes from our own snapshot, which the event pump keeps current
-        (``_events`` copies ``execution_generation`` off every frame), so no extra round-trip is
-        needed. A turn that moved between our read and the interrupt answers ``stale_generation``:
-        that turn is already gone, which is what the operator asked for, so it is not an error.
+        The generation is read ONCE, before the call: the operator aimed at the turn they could see,
+        and ``session.interrupt`` is a generation fence on purpose. Re-reading after a
+        ``stale_generation`` would aim the retry at the turn that REPLACED it — killing a stranger's
+        fresh work instead of the one that was asked about, which is exactly the substitution
+        ``_cancel_admission`` forbids. A stale answer means the turn the operator wanted gone is
+        already gone, so silence is the correct report.
         """
+        generation = (self._snapshots.get(session_id) or {}).get("execution_generation")
+        if generation is None:
+            return
         client = await self._client()
-        for attempt in range(3):
-            generation = (self._snapshots.get(session_id) or {}).get("execution_generation")
-            if generation is None:
+        try:
+            await client.rpc("session.interrupt", session_id=session_id,
+                             execution_generation=generation)
+        except GatewayClientError as exc:
+            if str(exc) == "stale_generation":
                 return
-            try:
-                await client.rpc("session.interrupt", session_id=session_id,
-                                 execution_generation=generation)
-                return
-            except GatewayClientError as exc:
-                if str(exc) != "stale_generation":
-                    raise
-                await asyncio.sleep(0.1 * (attempt + 1))
+            # ``session/cancel`` is an ACP notification: the SDK swallows whatever this raises, so a
+            # failure is otherwise invisible in every log the operator has.
+            logger.warning("session/cancel could not interrupt %s at generation %s: %s",
+                           session_id, generation, exc)
+            raise
 
     async def fork_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         from acp.schema import ForkSessionResponse

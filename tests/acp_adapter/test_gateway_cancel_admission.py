@@ -123,7 +123,31 @@ async def test_cancel_of_a_turn_that_just_settled_is_not_an_error():
     agent = agent_with_queued_prompt()
     agent._gateway.rpc.side_effect = GatewayClientError('stale_generation')
     await agent.cancel('s')
-    assert agent._gateway.rpc.await_count == 3  # bounded retries, then silence
+    agent._gateway.rpc.assert_awaited_once_with(
+        'session.interrupt', session_id='s', execution_generation=7)
+
+
+@pytest.mark.asyncio
+async def test_cancel_never_retargets_a_newer_generation():
+    """A stale answer must NOT be retried at the generation that replaced it.
+
+    The operator aimed at the turn they could see. Re-reading the snapshot after `stale_generation`
+    (what this did first) would substitute the successor generation and stop a stranger's fresh work
+    — the same substitution `_cancel_admission` forbids. Here the event pump reports generation 8
+    while the interrupt is in flight; only 7 may ever be interrupted.
+    """
+    agent = agent_with_queued_prompt()
+
+    async def rpc(method, **params):
+        if method == 'session.interrupt':
+            # The pump advanced the snapshot before the answer came back.
+            agent._snapshots['s']['execution_generation'] = 8
+            raise GatewayClientError('stale_generation')
+        return {}
+    agent._gateway.rpc.side_effect = rpc
+    await agent.cancel('s')
+    generations = [call.kwargs['execution_generation'] for call in agent._gateway.rpc.await_args_list]
+    assert generations == [7]
 
 
 @pytest.mark.asyncio

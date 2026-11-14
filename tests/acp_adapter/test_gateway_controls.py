@@ -19,10 +19,10 @@ async def test_cancel_uses_observed_generation_and_mutations_fail_explicitly(tmp
     agent._gateway = RPC()
     agent._snapshots["shared"] = {"execution_generation": 4, "revision": 7}
     # No ACP prompt in flight still means the operator's stop has to reach the session's running turn
-    # (#108); a generation this authority no longer holds is what the operator wanted anyway, so it
-    # is retried a bounded number of times and then reported as silence rather than an error.
+    # (#108). It is one attempt at the generation we could see: a generation this authority no longer
+    # holds is what the operator wanted anyway, so `stale_generation` is silence rather than an error.
     await agent.cancel("shared")
-    assert [method for method, _ in calls] == ["session.interrupt"] * 3
+    assert [method for method, _ in calls] == ["session.interrupt"]
     assert calls[0][1] == {"session_id": "shared", "execution_generation": 4}
     calls.clear()
     # Our own queued admission is cancelled by identity; a stale answer propagates verbatim
