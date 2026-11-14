@@ -1,4 +1,4 @@
-"""session/cancel cancels the ACP-owned admission, never another surface's running turn."""
+"""session/cancel stops this session's turn: our own admission first, otherwise the running generation."""
 import asyncio
 from unittest.mock import AsyncMock
 
@@ -96,10 +96,42 @@ async def test_cancel_during_submit_is_applied_when_admission_id_arrives():
 
 
 @pytest.mark.asyncio
-async def test_cancel_without_an_acp_prompt_leaves_other_surfaces_turn_alone():
+async def test_cancel_without_an_acp_prompt_stops_the_sessions_running_turn():
+    """#108: stop belongs to the session, not to the surface that submitted the prompt.
+
+    A gateway-owned session can be woken by a notice, a scheduler, or another viewer; the operator
+    watching it has one Stop button and it has to reach that turn. Returning silently here (the old
+    contract) made the cockpit report a stop that never happened.
+    """
     agent = agent_with_queued_prompt()
     await agent.cancel('s')
+    agent._gateway.rpc.assert_awaited_once_with(
+        'session.interrupt', session_id='s', execution_generation=7)
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_a_generation_has_nothing_to_interrupt():
+    agent = agent_with_queued_prompt()
+    agent._snapshots['s'] = {}
+    await agent.cancel('s')
     agent._gateway.rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_a_turn_that_just_settled_is_not_an_error():
+    """`stale_generation` means the turn the operator wanted gone is gone: report nothing."""
+    agent = agent_with_queued_prompt()
+    agent._gateway.rpc.side_effect = GatewayClientError('stale_generation')
+    await agent.cancel('s')
+    assert agent._gateway.rpc.await_count == 3  # bounded retries, then silence
+
+
+@pytest.mark.asyncio
+async def test_cancel_surfaces_a_real_interrupt_failure():
+    agent = agent_with_queued_prompt()
+    agent._gateway.rpc.side_effect = GatewayClientError('not_authorized')
+    with pytest.raises(GatewayClientError, match='not_authorized'):
+        await agent.cancel('s')
 
 @pytest.mark.asyncio
 async def test_deferred_cancel_failure_cleans_mapping_before_next_submit():

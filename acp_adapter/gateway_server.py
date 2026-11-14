@@ -500,8 +500,37 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if admission_id is None:
             if session_id in self._submitting:
                 self._pending_cancels.add(session_id)
+                return
+            await self._cancel_foreign_turn(session_id)
             return
         await self._cancel_admission(session_id, admission_id)
+
+    async def _cancel_foreign_turn(self, session_id):
+        """Stop a turn THIS viewer did not admit (#108).
+
+        A gateway-owned session outlives any one surface: the turn the operator can see running may
+        have been claimed by a background notice, a scheduled job, or another viewer. Stop belongs
+        to the SESSION, not to whoever happened to submit the prompt, so returning silently here
+        left the cockpit reporting a stop that never happened (issue #108).
+
+        The generation comes from our own snapshot, which the event pump keeps current
+        (``_events`` copies ``execution_generation`` off every frame), so no extra round-trip is
+        needed. A turn that moved between our read and the interrupt answers ``stale_generation``:
+        that turn is already gone, which is what the operator asked for, so it is not an error.
+        """
+        client = await self._client()
+        for attempt in range(3):
+            generation = (self._snapshots.get(session_id) or {}).get("execution_generation")
+            if generation is None:
+                return
+            try:
+                await client.rpc("session.interrupt", session_id=session_id,
+                                 execution_generation=generation)
+                return
+            except GatewayClientError as exc:
+                if str(exc) != "stale_generation":
+                    raise
+                await asyncio.sleep(0.1 * (attempt + 1))
 
     async def fork_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         from acp.schema import ForkSessionResponse
