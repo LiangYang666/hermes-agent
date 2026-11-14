@@ -500,8 +500,41 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if admission_id is None:
             if session_id in self._submitting:
                 self._pending_cancels.add(session_id)
+                return
+            await self._cancel_foreign_turn(session_id)
             return
         await self._cancel_admission(session_id, admission_id)
+
+    async def _cancel_foreign_turn(self, session_id):
+        """Stop a turn THIS viewer did not admit (#108).
+
+        A gateway-owned session outlives any one surface: the turn the operator can see running may
+        have been claimed by a background notice, a scheduled job, or another viewer. Stop belongs
+        to the SESSION, not to whoever happened to submit the prompt, so returning silently here
+        left the cockpit reporting a stop that never happened (issue #108).
+
+        The generation is read ONCE, before the call: the operator aimed at the turn they could see,
+        and ``session.interrupt`` is a generation fence on purpose. Re-reading after a
+        ``stale_generation`` would aim the retry at the turn that REPLACED it — killing a stranger's
+        fresh work instead of the one that was asked about, which is exactly the substitution
+        ``_cancel_admission`` forbids. A stale answer means the turn the operator wanted gone is
+        already gone, so silence is the correct report.
+        """
+        generation = (self._snapshots.get(session_id) or {}).get("execution_generation")
+        if generation is None:
+            return
+        client = await self._client()
+        try:
+            await client.rpc("session.interrupt", session_id=session_id,
+                             execution_generation=generation)
+        except GatewayClientError as exc:
+            if str(exc) == "stale_generation":
+                return
+            # ``session/cancel`` is an ACP notification: the SDK swallows whatever this raises, so a
+            # failure is otherwise invisible in every log the operator has.
+            logger.warning("session/cancel could not interrupt %s at generation %s: %s",
+                           session_id, generation, exc)
+            raise
 
     async def fork_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         from acp.schema import ForkSessionResponse

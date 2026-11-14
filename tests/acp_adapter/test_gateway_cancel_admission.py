@@ -1,4 +1,4 @@
-"""session/cancel cancels the ACP-owned admission, never another surface's running turn."""
+"""session/cancel stops this session's turn: our own admission first, otherwise the running generation."""
 import asyncio
 from unittest.mock import AsyncMock
 
@@ -96,10 +96,66 @@ async def test_cancel_during_submit_is_applied_when_admission_id_arrives():
 
 
 @pytest.mark.asyncio
-async def test_cancel_without_an_acp_prompt_leaves_other_surfaces_turn_alone():
+async def test_cancel_without_an_acp_prompt_stops_the_sessions_running_turn():
+    """#108: stop belongs to the session, not to the surface that submitted the prompt.
+
+    A gateway-owned session can be woken by a notice, a scheduler, or another viewer; the operator
+    watching it has one Stop button and it has to reach that turn. Returning silently here (the old
+    contract) made the cockpit report a stop that never happened.
+    """
     agent = agent_with_queued_prompt()
     await agent.cancel('s')
+    agent._gateway.rpc.assert_awaited_once_with(
+        'session.interrupt', session_id='s', execution_generation=7)
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_a_generation_has_nothing_to_interrupt():
+    agent = agent_with_queued_prompt()
+    agent._snapshots['s'] = {}
+    await agent.cancel('s')
     agent._gateway.rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_a_turn_that_just_settled_is_not_an_error():
+    """`stale_generation` means the turn the operator wanted gone is gone: report nothing."""
+    agent = agent_with_queued_prompt()
+    agent._gateway.rpc.side_effect = GatewayClientError('stale_generation')
+    await agent.cancel('s')
+    agent._gateway.rpc.assert_awaited_once_with(
+        'session.interrupt', session_id='s', execution_generation=7)
+
+
+@pytest.mark.asyncio
+async def test_cancel_never_retargets_a_newer_generation():
+    """A stale answer must NOT be retried at the generation that replaced it.
+
+    The operator aimed at the turn they could see. Re-reading the snapshot after `stale_generation`
+    (what this did first) would substitute the successor generation and stop a stranger's fresh work
+    — the same substitution `_cancel_admission` forbids. Here the event pump reports generation 8
+    while the interrupt is in flight; only 7 may ever be interrupted.
+    """
+    agent = agent_with_queued_prompt()
+
+    async def rpc(method, **params):
+        if method == 'session.interrupt':
+            # The pump advanced the snapshot before the answer came back.
+            agent._snapshots['s']['execution_generation'] = 8
+            raise GatewayClientError('stale_generation')
+        return {}
+    agent._gateway.rpc.side_effect = rpc
+    await agent.cancel('s')
+    generations = [call.kwargs['execution_generation'] for call in agent._gateway.rpc.await_args_list]
+    assert generations == [7]
+
+
+@pytest.mark.asyncio
+async def test_cancel_surfaces_a_real_interrupt_failure():
+    agent = agent_with_queued_prompt()
+    agent._gateway.rpc.side_effect = GatewayClientError('not_authorized')
+    with pytest.raises(GatewayClientError, match='not_authorized'):
+        await agent.cancel('s')
 
 @pytest.mark.asyncio
 async def test_deferred_cancel_failure_cleans_mapping_before_next_submit():
