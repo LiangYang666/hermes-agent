@@ -213,11 +213,15 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
-        """Create a new session with a unique ID and a fresh AIAgent."""
+    def create_session(self, cwd: str = ".", *, disabled_toolsets: list[str] | None = None) -> SessionState:
+        """Create a new session with a unique ID and a fresh AIAgent.
+
+        ``disabled_toolsets`` is a per-session editor request (a cockpit disabling `todo`); ``None``
+        derives from config, so CLI/cron/Studio launches keep their own toolsets.
+        """
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(session_id=session_id, cwd=cwd, disabled_toolsets=disabled_toolsets)
         state = self._install_state(session_id, agent, cwd, getattr(agent, "model", "") or "", [])
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
@@ -568,12 +572,16 @@ class SessionManager:
             resolved = _get_platform_tools(config, "acp")
             mcp_servers = resolved & enabled_mcp_server_names(config)
             enabled_toolsets = _expand_acp_enabled_toolsets(sorted(resolved - mcp_servers), sorted(mcp_servers))
+        # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
+        # A cockpit editor may ADD disables for this session, but must never REPLACE the profile's —
+        # same capability-escalation guard and SAME helper as the gateway path (no implementation drift).
+        from gateway.session_local_editor import merge_cockpit_disabled
+        _cfg_disabled = parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets"))
+        _effective_disabled = merge_cockpit_disabled(_cfg_disabled, disabled_toolsets) if disabled_toolsets is not None else _cfg_disabled
         kwargs = {
             "platform": "acp", "quiet_mode": True, "session_id": session_id, "session_db": self._get_db(),
             "enabled_toolsets": list(enabled_toolsets),
-            # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
-            "disabled_toolsets": (list(disabled_toolsets) if disabled_toolsets is not None
-                                  else parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) or None),
+            "disabled_toolsets": _effective_disabled or None,
             "model": resolved_model,
             "cwd": cwd,
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never

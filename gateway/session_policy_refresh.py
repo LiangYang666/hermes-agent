@@ -65,6 +65,20 @@ def _settings(policy, config, live, picked):
         keys.append('disabled_toolsets')
         _follow(config, live, 'platform_toolsets')
         toolsets = tuple(sorted(_resolve_toolsets({}, live, policy.source, policy.safe_mode, policy.coding_posture)))
+    # A cockpit editor froze its own disabled_toolsets at create (Agentus disables `todo`). That key
+    # is session policy, not a profile setting — following the profile here would silently re-enable
+    # tools the cockpit deliberately turned off. Keep the frozen value when the launch request carries
+    # an editor selection of it (same shape as an explicit `toolsets` pick staying).
+    request_editor = request.get('editor') or {}
+    editor_disabled = request_editor.get('disabled_toolsets') if isinstance(request_editor, dict) else None
+    if isinstance(editor_disabled, list) and editor_disabled:
+        if 'disabled_toolsets' in keys:
+            keys.remove('disabled_toolsets')
+        # UNION, never replace (same invariant as build_policy): the profile may have GAINED a
+        # disallowed toolset since create — follow that addition — but must never lose one. A client
+        # cannot use the editor key to re-enable what the operator disabled.
+        from gateway.session_local_editor import merge_cockpit_disabled
+        agent['disabled_toolsets'] = merge_cockpit_disabled(live_agent.get('disabled_toolsets'), editor_disabled)
     for key in keys:
         _follow(agent, live_agent, key)
     if agent or 'agent' in config:

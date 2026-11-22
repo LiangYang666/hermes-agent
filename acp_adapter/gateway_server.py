@@ -303,10 +303,19 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # inherit it, so it is frozen into THIS session's policy or not at all.
         if _observing_session():
             flags = {**flags, 'observer': True}
+        # A cockpit editor can ask that built-in toolsets be disabled for THIS session only (the
+        # Agentus cockpit disables `todo` so its own plan MCP tool is the one on the operator's card).
+        # It arrives under `_meta.agentus`, which the ACP router expands into this kwarg. Persist it
+        # in the session policy via the editor; other surfaces (CLI/cron/Studio) never send it.
+        cockpit = kwargs.get('agentus') or {}
+        disabled = cockpit.get('disabled_toolsets') if isinstance(cockpit, dict) else None
+        editor = {"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
+                  "edit_approval_policy": "ask"}
+        if isinstance(disabled, list) and disabled:
+            editor['disabled_toolsets'] = list(disabled)
         snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex,
             source="acp", cwd=_translate_acp_cwd(cwd),
-            editor={"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
-                    "edit_approval_policy": "ask"}, **flags)
+            editor=editor, **flags)
         session_id = snapshot["session_id"]
         await self._adopt(session_id, snapshot)
         if mcp_servers:
@@ -416,6 +425,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             if "acp-session-mcp-v1" not in descriptor.get("capabilities", []):
                 raise GatewayClientError("acp_mcp_policy_unavailable")
             resume_params['editor'] = {'mcp_servers': [s.model_dump(by_alias=True) for s in mcp_servers]}
+        # NOTE: per-session toolset disable (the cockpit's `_meta.agentus.disabled_toolsets`) is a
+        # CREATE-TIME decision only. The owner freezes it into the session policy on `session.create`,
+        # and a resume/load replays that frozen value; `session.resume` has no persisted-toolset
+        # mutation channel, so sending it here would be a silent no-op. The load/resume handshake still
+        # carries the key for forward compatibility, but the fork deliberately ignores it here.
         try:
             snapshot = await client.rpc("session.resume", session_id=session_id, **resume_params)
         except GatewayRPCError as exc:

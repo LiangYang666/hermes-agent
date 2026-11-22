@@ -467,8 +467,23 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
         _refuse('row_cwd', 'must be an absolute path when set')
     if params.get('cwd_explicit') is False and 'cwd' in params:
         cwd = _profile_workspace_cwd(get_hermes_home()) or cwd
-    from gateway.session_local_editor import validate_editor
+    from gateway.session_local_editor import validate_editor, merge_cockpit_disabled
     validate_editor(source, params.get('editor'))
+    # A cockpit editor's per-session toolset disable freezes into THIS session's config, the same
+    # key the agent reads when building tools (model_tools._apply_toolset_selection). It is scoped to
+    # the session policy — a CLI/cron/Studio launch without this editor key never sees it. Do this
+    # BEFORE _resolve_toolsets so the enabled set is derived with the disable already in place.
+    editor = params.get('editor') or {}
+    disabled = editor.get('disabled_toolsets') if isinstance(editor, dict) else None
+    if isinstance(disabled, list) and disabled:
+        # Union with the profile's own disable, never replace it: `agentus` is just a normal _meta
+        # key any ACP client can send, so an editor REPLACING the list would let a client re-enable
+        # toolsets the operator disabled (terminal/delegate) — a capability escalation. Merging keeps
+        # the invariant "a session can only ever have FEWER tools than its profile allows".
+        from agent.skill_utils import parse_config_string_list
+        existing = parse_config_string_list((config.get('agent') or {}).get('disabled_toolsets'))
+        merged = merge_cockpit_disabled(existing, disabled)
+        config.setdefault('agent', {})['disabled_toolsets'] = merged
     launch_skills(params)
     config = present_sections(json.loads(json.dumps(config)))
     picked_route = {'model', 'provider', 'base_url'} & set(_without_auto_pick(params))
