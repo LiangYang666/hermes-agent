@@ -574,14 +574,15 @@ class SessionManager:
             enabled_toolsets = _expand_acp_enabled_toolsets(sorted(resolved - mcp_servers), sorted(mcp_servers))
         # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
         # A cockpit editor may ADD disables for this session, but must never REPLACE the profile's —
-        # same capability-escalation guard as the gateway path. Union, drop wildcards, cap the size.
+        # same capability-escalation guard as the gateway path. Union, drop wildcards; the cockpit's
+        # request is capped, the operator's own disable is always kept whole.
         _cfg_disabled = parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets"))
         if disabled_toolsets is not None:
-            _merged = set(_cfg_disabled)
+            _effective_disabled = set(_cfg_disabled)  # keep the operator's disable WHOLE
             for _t in (disabled_toolsets or [])[:16]:
                 if isinstance(_t, str) and _t.strip().lower() not in {"all", "*", ""} and _t.strip():
-                    _merged.add(_t.strip().lower())
-            _effective_disabled = sorted(_merged)[:16]
+                    _effective_disabled.add(_t.strip().lower())
+            _effective_disabled = sorted(_effective_disabled)
         else:
             _effective_disabled = _cfg_disabled
         kwargs = {

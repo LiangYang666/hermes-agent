@@ -22,14 +22,18 @@ def merge_cockpit_disabled(existing, requested):
     capability-escalation guard: an editor can only ADD disables, never clear one the operator set.
     """
     from agent.skill_utils import parse_config_string_list
+    # The operator's profile disable is authoritative and kept WHOLE — truncation must never drop
+    # one of its entries (that would silently re-enable a tool). Only the untrusted cockpit request
+    # is bounded, before it is unioned in.
     merged = set(parse_config_string_list(existing))
+    added = set()
     if isinstance(requested, list):
         for item in requested[:COCKPIT_DISABLE_MAX]:
             if isinstance(item, str):
                 name = item.strip().lower()
                 if name and name not in _COCKPIT_DISABLE_FORBIDDEN:
-                    merged.add(name)
-    return sorted(merged)[:COCKPIT_DISABLE_MAX]
+                    added.add(name)
+    return sorted(merged | added)
 
 
 def validate_editor(source, editor):
