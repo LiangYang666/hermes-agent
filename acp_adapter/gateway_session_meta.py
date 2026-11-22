@@ -254,14 +254,25 @@ def usage_update(stats: dict) -> UsageUpdate | None:
 def turn_usage(stats) -> Usage | None:
     """``PromptResponse.usage``: the agent's session counters, the figures main's turn result carried.
 
-    Both cache buckets are forwarded, and an unreported bucket stays ``None``: ``input_tokens`` is the
-    FULL prompt (fresh + read + write), so a client that is told "read only" both reconciles the
-    prompt total wrongly and bills the writes as free (issue #71). A zero here would be a measured
-    value nobody measured.
+    Both cache buckets are forwarded, and an unreported bucket stays ``None``. ``input_tokens`` is
+    the FULL prompt (fresh + read + write): ACP's ``Usage.input_tokens`` is what the cockpit divides
+    cached reads by for the hit rate, and the cache buckets are a SUBSET of it, not peers beside it.
+    The agent's session counters split them — ``input_tokens`` is FRESH (normalize_usage subtracts
+    read + write), ``prompt_tokens`` is the full sum — so forward ``prompt_tokens`` here. Sending the
+    fresh counter made read/fresh exceed 100% on every cache-heavy turn and pinned the cockpit's hit
+    rate at a clamped 100% (issue #71's invariant, broken by the 0.23 gateway path). Fall back to
+    ``input_tokens`` only for counters that predate the split. A zero would be a measured value
+    nobody measured.
     """
     if not isinstance(stats, dict):
         return None
-    return Usage(input_tokens=int(stats.get("input_tokens") or 0), output_tokens=int(stats.get("output_tokens") or 0),
+    prompt_total = stats.get("prompt_tokens")
+    # Only a genuine positive int is the full prompt. A float from a version-skewed producer, or
+    # True (isinstance(True, int) is True!), must not be mistaken for a real prompt total — accept
+    # a numeric value via int() only when it is a plain int/bool-safe conversion, else fall back.
+    if isinstance(prompt_total, bool) or not isinstance(prompt_total, (int, float)) or prompt_total <= 0:
+        prompt_total = stats.get("input_tokens") or 0
+    return Usage(input_tokens=int(prompt_total), output_tokens=int(stats.get("output_tokens") or 0),
                  total_tokens=int(stats.get("total_tokens") or 0),
                  thought_tokens=stats.get("reasoning_tokens") or None,
                  cached_read_tokens=stats.get("cache_read_tokens") or None,
