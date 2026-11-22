@@ -213,11 +213,15 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
-        """Create a new session with a unique ID and a fresh AIAgent."""
+    def create_session(self, cwd: str = ".", *, disabled_toolsets: list[str] | None = None) -> SessionState:
+        """Create a new session with a unique ID and a fresh AIAgent.
+
+        ``disabled_toolsets`` is a per-session editor request (a cockpit disabling `todo`); ``None``
+        derives from config, so CLI/cron/Studio launches keep their own toolsets.
+        """
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(session_id=session_id, cwd=cwd, disabled_toolsets=disabled_toolsets)
         state = self._install_state(session_id, agent, cwd, getattr(agent, "model", "") or "", [])
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state

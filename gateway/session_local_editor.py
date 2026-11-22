@@ -20,13 +20,23 @@ def validate_editor(source, editor):
     if not isinstance(editor, dict):
         raise RuntimeStoreError('invalid_params', field='editor',
                                 detail=f'must be a mapping, got {type(editor).__name__}')
-    unknown = sorted(set(editor) - {'mcp_servers', 'edit_approval_policy'})
+    unknown = sorted(set(editor) - {'mcp_servers', 'edit_approval_policy', 'disabled_toolsets'})
     if unknown:
         raise RuntimeStoreError('invalid_params', field=f'editor.{unknown[0]}',
                                 detail='unknown editor key')
     if editor.get('edit_approval_policy', 'ask') != 'ask':
         raise RuntimeStoreError('invalid_params', field='editor.edit_approval_policy',
                                 detail="must be 'ask': every edit is approved one at a time")
+    # A cockpit editor may ask that built-in toolsets be disabled for THIS session only (e.g. the
+    # Agentus cockpit disables `todo` so its own plan MCP tool is the one the operator watches).
+    # Frozen into the session policy below, never read from this process's global config — a CLI or
+    # cron session without this editor key keeps its own toolsets.
+    if not isinstance(editor.get('disabled_toolsets', []), list):
+        raise RuntimeStoreError('invalid_params', field='editor.disabled_toolsets',
+                                detail=f'must be a list of toolset names, got {type(editor.get("disabled_toolsets")).__name__}')
+    if any(not isinstance(t, str) or not t for t in editor.get('disabled_toolsets', [])):
+        raise RuntimeStoreError('invalid_params', field='editor.disabled_toolsets',
+                                detail='every entry must be a non-empty toolset name')
     if not isinstance(editor.get('mcp_servers', []), list):
         raise RuntimeStoreError('invalid_params', field='editor.mcp_servers',
                                 detail=f'must be a list, got {type(editor.get("mcp_servers")).__name__}')

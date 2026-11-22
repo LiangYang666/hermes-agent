@@ -615,7 +615,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     async def new_session(self, cwd: str, mcp_servers: list | None = None, **kwargs: Any) -> NewSessionResponse:
         # Agent construction (config, memory-provider import, SessionDB) is slow and fully
         # blocking; inline it froze the loop serving every JSON-RPC request (#58083).
-        state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd)
+        # `_meta.agentus.disabled_toolsets` (expanded into kwargs) is a per-session editor request:
+        # a cockpit disabling `todo` so its own plan MCP tool is the operator's one. Other surfaces
+        # never send it, so `None` keeps their config-derived toolsets.
+        cockpit = kwargs.get('agentus') or {}
+        disabled = cockpit.get('disabled_toolsets') if isinstance(cockpit, dict) else None
+        disabled = list(disabled) if isinstance(disabled, list) and disabled else None
+        state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd, disabled_toolsets=disabled)
         await self._attach_session_mcp(state, mcp_servers, "New session %s (cwd=%s)", state.session_id, cwd)
         return NewSessionResponse(session_id=state.session_id, **await self._session_response_fields(state))
 

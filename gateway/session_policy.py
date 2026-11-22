@@ -469,6 +469,14 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
         cwd = _profile_workspace_cwd(get_hermes_home()) or cwd
     from gateway.session_local_editor import validate_editor
     validate_editor(source, params.get('editor'))
+    # A cockpit editor's per-session toolset disable freezes into THIS session's config, the same
+    # key the agent reads when building tools (model_tools._apply_toolset_selection). It is scoped to
+    # the session policy — a CLI/cron/Studio launch without this editor key never sees it. Do this
+    # BEFORE _resolve_toolsets so the enabled set is derived with the disable already in place.
+    editor = params.get('editor') or {}
+    disabled = editor.get('disabled_toolsets') if isinstance(editor, dict) else None
+    if isinstance(disabled, list) and disabled:
+        config.setdefault('agent', {})['disabled_toolsets'] = list(disabled)
     launch_skills(params)
     config = present_sections(json.loads(json.dumps(config)))
     picked_route = {'model', 'provider', 'base_url'} & set(_without_auto_pick(params))
