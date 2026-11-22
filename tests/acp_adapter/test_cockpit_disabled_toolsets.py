@@ -107,3 +107,32 @@ def test_merge_helper_drops_wildcards_keeps_profile(tmp_path):
     out = merge_cockpit_disabled(['terminal'], ['todo', 'all', '*', 3, 'todo'])
     assert set(out) == {'terminal', 'todo'}
 
+
+def test_merge_helper_NEVER_truncates_profile_disable(tmp_path):
+    """B1-NEW regression: a >16-entry profile must keep ALL its entries; only the cockpit request is capped."""
+    from gateway.session_local_editor import merge_cockpit_disabled
+    profile = [f'z{i:02d}' for i in range(20)]          # 20 operator-disabled toolsets
+    attack = [f'a{i:02d}' for i in range(16)]           # 16 lexically-earlier names from a client
+    out = merge_cockpit_disabled(profile, attack)
+    # Every operator entry survives (no truncation of the authoritative side).
+    assert set(profile) <= set(out)
+    # The cockpit additions are capped at 16, no wildcards/duplicates.
+    assert len([x for x in out if x.startswith('a')]) <= 16
+    # Even a single harmless request must not drop the tail of a >16 profile.
+    out2 = merge_cockpit_disabled(profile, ['todo'])
+    assert set(profile) <= set(out2) and 'todo' in out2
+
+
+def test_build_policy_keeps_all_profile_disables_over_16(tmp_path):
+    """B1-NEW end-to-end via build_policy: profile's 20 disables all survive."""
+    profile_entries = [f'z{i:02d}' for i in range(20)]
+    profile = {'agent': {'disabled_toolsets': profile_entries}}
+    policy = build_policy(
+        {'source': 'acp', 'cwd': str(tmp_path), 'model': 'fixture',
+         'editor': {'disabled_toolsets': ['todo']}},
+        profile,
+    )
+    config = json.loads(policy.config_json)
+    assert set(profile_entries) <= set(config['agent']['disabled_toolsets'])
+    assert 'todo' in config['agent']['disabled_toolsets']
+
