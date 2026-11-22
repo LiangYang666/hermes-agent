@@ -74,7 +74,11 @@ def _settings(policy, config, live, picked):
     if isinstance(editor_disabled, list) and editor_disabled:
         if 'disabled_toolsets' in keys:
             keys.remove('disabled_toolsets')
-        agent['disabled_toolsets'] = list(editor_disabled)
+        # UNION, never replace (same invariant as build_policy): the profile may have GAINED a
+        # disallowed toolset since create — follow that addition — but must never lose one. A client
+        # cannot use the editor key to re-enable what the operator disabled.
+        from gateway.session_local_editor import merge_cockpit_disabled
+        agent['disabled_toolsets'] = merge_cockpit_disabled(live_agent.get('disabled_toolsets'), editor_disabled)
     for key in keys:
         _follow(agent, live_agent, key)
     if agent or 'agent' in config:

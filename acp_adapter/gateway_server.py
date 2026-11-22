@@ -401,7 +401,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         await client.rpc("session.detach", session_id=session_id, subscription_id=adopted["subscription_id"])
         return await client.rpc("session.info", session_id=session_id)
 
-    async def _resume(self, cwd, held_id, mcp_servers, cockpit=None):
+    async def _resume(self, cwd, held_id, mcp_servers):
         client = await self._client()
         from acp_adapter.catalog import logical_session_id
         from hermes_cli.gateway_client import GatewayRPCError
@@ -417,9 +417,6 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             await self._conn.session_update(session_id=held_id, update=acp.update_agent_message_text(
                 "Attached to the gateway's existing session policy; editor cwd is not applied.\n"))
         resume_params = {}
-        cockpit = cockpit if isinstance(cockpit, dict) else {}
-        disabled = cockpit.get('disabled_toolsets')
-        editor = {}
         if mcp_servers:
             # A non-empty list is the editor's selection. An empty one (load always carries a list)
             # keeps the session's servers, as fork does: a second editor without MCP config must not
@@ -427,13 +424,12 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             descriptor = await client.rpc("runtime.describe")
             if "acp-session-mcp-v1" not in descriptor.get("capabilities", []):
                 raise GatewayClientError("acp_mcp_policy_unavailable")
-            editor['mcp_servers'] = [s.model_dump(by_alias=True) for s in mcp_servers]
-        # A cockpit's per-session toolset disable (Agentus disables `todo`) must survive resume too:
-        # it goes through the same editor channel and is frozen into the session policy by the owner.
-        if isinstance(disabled, list) and disabled:
-            editor['disabled_toolsets'] = list(disabled)
-        if editor:
-            resume_params['editor'] = editor
+            resume_params['editor'] = {'mcp_servers': [s.model_dump(by_alias=True) for s in mcp_servers]}
+        # NOTE: per-session toolset disable (the cockpit's `_meta.agentus.disabled_toolsets`) is a
+        # CREATE-TIME decision only. The owner freezes it into the session policy on `session.create`,
+        # and a resume/load replays that frozen value; `session.resume` has no persisted-toolset
+        # mutation channel, so sending it here would be a silent no-op. The load/resume handshake still
+        # carries the key for forward compatibility, but the fork deliberately ignores it here.
         try:
             snapshot = await client.rpc("session.resume", session_id=session_id, **resume_params)
         except GatewayRPCError as exc:
@@ -479,10 +475,10 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         self._mutations.acknowledge(session_id, 'editor_mcp', editor)
 
     async def load_session(self, cwd, session_id, mcp_servers=None, **kwargs):
-        return LoadSessionResponse(**await self._resume(cwd, session_id, mcp_servers, kwargs.get('agentus')))
+        return LoadSessionResponse(**await self._resume(cwd, session_id, mcp_servers))
 
     async def resume_session(self, cwd, session_id, mcp_servers=None, **kwargs):
-        return ResumeSessionResponse(**await self._resume(cwd, session_id, mcp_servers, kwargs.get('agentus')))
+        return ResumeSessionResponse(**await self._resume(cwd, session_id, mcp_servers))
 
     async def _cancel_admission(self, session_id, admission_id):
         client = await self._client()

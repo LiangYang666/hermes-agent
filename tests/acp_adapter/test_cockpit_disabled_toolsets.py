@@ -66,3 +66,44 @@ def test_refresh_follows_profile_when_no_editor_selection(tmp_path):
     refreshed, _, _ = refreshed_policy(policy, live, json.loads(policy.terminal_json))
     config = json.loads(refreshed.config_json)
     assert config['agent']['disabled_toolsets'] == ['project']
+
+
+# ── B1: a cockpit editor can only ADD disables, never revoke the operator's ───────────────────
+def test_build_policy_MERGES_with_profile_disabled_not_replaces(tmp_path):
+    """B1 regression: editor `['todo']` must not erase profile `['terminal','delegate']`."""
+    profile = {'agent': {'disabled_toolsets': ['terminal', 'delegate']}}
+    policy = build_policy(
+        {'source': 'acp', 'cwd': str(tmp_path), 'model': 'fixture',
+         'editor': {'disabled_toolsets': ['todo']}},
+        profile,
+    )
+    config = json.loads(policy.config_json)
+    assert set(config['agent']['disabled_toolsets']) == {'terminal', 'delegate', 'todo'}
+
+
+def test_refresh_preserves_profile_gain_and_cockpit_disable(tmp_path):
+    """B1 regression on resume: profile gained `project`, cockpit still has `todo`."""
+    policy = build_policy(
+        {'source': 'acp', 'cwd': str(tmp_path), 'model': 'fixture',
+         'editor': {'disabled_toolsets': ['todo']}},
+        {'agent': {'disabled_toolsets': ['terminal']}},
+    )
+    live = {'agent': {'disabled_toolsets': ['terminal', 'project']}}
+    refreshed, _, _ = refreshed_policy(policy, live, json.loads(policy.terminal_json))
+    config = json.loads(refreshed.config_json)
+    # Gained `project` followed, operator's `terminal` kept, cockpit's `todo` kept.
+    assert set(config['agent']['disabled_toolsets']) == {'terminal', 'project', 'todo'}
+
+
+@pytest.mark.parametrize('bad', [['all'], ['*'], ['todo', ''], ['a'] * 17])
+def test_validate_editor_rejects_wildcards_and_oversize(bad):
+    """N1: no `all`/`*` wildcard, no unbounded list smuggled into the policy."""
+    with pytest.raises(RuntimeStoreError):
+        validate_editor('acp', {'disabled_toolsets': bad})
+
+
+def test_merge_helper_drops_wildcards_keeps_profile(tmp_path):
+    from gateway.session_local_editor import merge_cockpit_disabled
+    out = merge_cockpit_disabled(['terminal'], ['todo', 'all', '*', 3, 'todo'])
+    assert set(out) == {'terminal', 'todo'}
+

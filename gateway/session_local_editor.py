@@ -6,6 +6,32 @@ import uuid
 from hermes_state_runtime import RuntimeStoreError
 
 
+# A cockpit editor may add toolsets to the per-session disable, never remove the profile's. These
+# guards keep an arbitrary ACP _meta client from (a) disabling everything via a wildcard, or (b)
+# smuggling an unbounded list into the persisted policy. Reused by build_policy and the resume
+# refresh so both paths enforce the same "only ever fewer tools" invariant.
+COCKPIT_DISABLE_MAX = 16
+_COCKPIT_DISABLE_FORBIDDEN = frozenset({'all', '*', ''})
+
+
+def merge_cockpit_disabled(existing, requested):
+    """Union of the profile's disabled toolsets and a cockpit editor's request, sorted + bounded.
+
+    `requested` entries that are wildcards or non-strings are dropped. Cap the total so a hostile
+    client cannot persist an enormous list. Existing (profile) entries are always kept — this is the
+    capability-escalation guard: an editor can only ADD disables, never clear one the operator set.
+    """
+    from agent.skill_utils import parse_config_string_list
+    merged = set(parse_config_string_list(existing))
+    if isinstance(requested, list):
+        for item in requested[:COCKPIT_DISABLE_MAX]:
+            if isinstance(item, str):
+                name = item.strip().lower()
+                if name and name not in _COCKPIT_DISABLE_FORBIDDEN:
+                    merged.add(name)
+    return sorted(merged)[:COCKPIT_DISABLE_MAX]
+
+
 def validate_editor(source, editor):
     """The launch's editor policy, or a refusal that names the key it read (create path totality).
 
@@ -31,12 +57,16 @@ def validate_editor(source, editor):
     # Agentus cockpit disables `todo` so its own plan MCP tool is the one the operator watches).
     # Frozen into the session policy below, never read from this process's global config — a CLI or
     # cron session without this editor key keeps its own toolsets.
-    if not isinstance(editor.get('disabled_toolsets', []), list):
+    dts = editor.get('disabled_toolsets', [])
+    if not isinstance(dts, list):
         raise RuntimeStoreError('invalid_params', field='editor.disabled_toolsets',
-                                detail=f'must be a list of toolset names, got {type(editor.get("disabled_toolsets")).__name__}')
-    if any(not isinstance(t, str) or not t for t in editor.get('disabled_toolsets', [])):
+                                detail=f'must be a list of toolset names, got {type(dts).__name__}')
+    if len(dts) > COCKPIT_DISABLE_MAX:
         raise RuntimeStoreError('invalid_params', field='editor.disabled_toolsets',
-                                detail='every entry must be a non-empty toolset name')
+                                detail=f'at most {COCKPIT_DISABLE_MAX} toolsets')
+    if any(not isinstance(t, str) or t.strip().lower() in _COCKPIT_DISABLE_FORBIDDEN for t in dts):
+        raise RuntimeStoreError('invalid_params', field='editor.disabled_toolsets',
+                                detail='every entry must be a non-empty toolset name (no all/*)')
     if not isinstance(editor.get('mcp_servers', []), list):
         raise RuntimeStoreError('invalid_params', field='editor.mcp_servers',
                                 detail=f'must be a list, got {type(editor.get("mcp_servers")).__name__}')

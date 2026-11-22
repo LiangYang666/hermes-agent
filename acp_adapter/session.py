@@ -572,12 +572,22 @@ class SessionManager:
             resolved = _get_platform_tools(config, "acp")
             mcp_servers = resolved & enabled_mcp_server_names(config)
             enabled_toolsets = _expand_acp_enabled_toolsets(sorted(resolved - mcp_servers), sorted(mcp_servers))
+        # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
+        # A cockpit editor may ADD disables for this session, but must never REPLACE the profile's —
+        # same capability-escalation guard as the gateway path. Union, drop wildcards, cap the size.
+        _cfg_disabled = parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets"))
+        if disabled_toolsets is not None:
+            _merged = set(_cfg_disabled)
+            for _t in (disabled_toolsets or [])[:16]:
+                if isinstance(_t, str) and _t.strip().lower() not in {"all", "*", ""} and _t.strip():
+                    _merged.add(_t.strip().lower())
+            _effective_disabled = sorted(_merged)[:16]
+        else:
+            _effective_disabled = _cfg_disabled
         kwargs = {
             "platform": "acp", "quiet_mode": True, "session_id": session_id, "session_db": self._get_db(),
             "enabled_toolsets": list(enabled_toolsets),
-            # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
-            "disabled_toolsets": (list(disabled_toolsets) if disabled_toolsets is not None
-                                  else parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) or None),
+            "disabled_toolsets": _effective_disabled or None,
             "model": resolved_model,
             "cwd": cwd,
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never
