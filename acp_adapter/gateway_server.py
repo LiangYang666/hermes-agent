@@ -50,7 +50,7 @@ def _observing_session() -> bool:
     session. The role has to be resolved HERE because the owner is a different process shared by
     every other session and never inherits it.
     """
-    return (os.environ.get("AGENTUS_SESSION_ROLE") or "").strip().lower() == "observer"
+    return (os.environ.get("HERMES_STUDIO_SESSION_ROLE") or os.environ.get("AGENTUS_SESSION_ROLE") or "").strip().lower() == "observer"
 
 
 def _bypass_route():
@@ -307,7 +307,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # Agentus cockpit disables `todo` so its own plan MCP tool is the one on the operator's card).
         # It arrives under `_meta.agentus`, which the ACP router expands into this kwarg. Persist it
         # in the session policy via the editor; other surfaces (CLI/cron/Studio) never send it.
-        cockpit = kwargs.get('agentus') or {}
+        cockpit = kwargs.get('hermesStudio') or kwargs.get('agentus') or {}
         disabled = cockpit.get('disabled_toolsets') if isinstance(cockpit, dict) else None
         editor = {"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
                   "edit_approval_policy": "ask"}
