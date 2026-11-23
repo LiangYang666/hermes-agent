@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from functools import partial
 import hmac
 import json
+import logging
 import re
 import uuid
 
@@ -57,10 +58,12 @@ def check_api_turn(authority, ref, payload):
         # 'browser_control' is accepted and ignored: admissions persisted while the removed
         # browser-extension control existed may carry it and must still recover.
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'relay_metadata', 'resume_unanswered', 'history_from_store', 'history_not_transcript'}
                 or data.get('resume_unanswered', True) is not True
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
+                or not isinstance(data.get('history_from_store', False), bool)
+                or not isinstance(data.get('history_not_transcript', False), bool)
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))):
             raise RuntimeStoreError('invalid_params')
@@ -165,6 +168,14 @@ def admit_api_steps(adapter, **kwargs):
         settings['route'] = {k: v for k, v in route.items() if k != 'api_key'}
     payload = json.loads(_json({'text': kwargs['user_message'], 'api_turn_v1': {
         'history': None if kwargs.get('history_from_session') else kwargs['conversation_history'], 'settings': settings}}))
+    if kwargs.get('history_from_store'):
+        # issue #114: the history is a store snapshot; keep it in the payload for exact-retry
+        # identity and media pruning, but drop it at execution so the turn reads the transcript.
+        payload['api_turn_v1']['history_from_store'] = True
+    if kwargs.get('history_not_transcript'):
+        # issue #114: client-owned / multi-item prefix rows never reach the transcript; mark the
+        # session as store-carried so a later store turn does not swallow them.
+        payload['api_turn_v1']['history_not_transcript'] = True
     run_owner_scope = kwargs.get('run_owner_scope')
     if run_owner_scope is not None:
         if not _valid_owner_scope(run_owner_scope):
@@ -444,7 +455,28 @@ def prepare_api_execution(authority, ref, payload):
     if data and isinstance(content, list):
         from gateway.session_api_media import restore_api_images
         content = restore_api_images(content, data.get('media') or [])
-    return {'adapter': adapter, 'settings': settings, 'history': data['history'] if data else None,
+    history = data['history'] if data else None
+    # issue #114: a `conversation`/`previous_response_id` snapshot is frozen at admission time.
+    # A queued turn that executes it answers the previous turn again and re-compresses an already
+    # compressed transcript. Drop it and let _load_turn_history read the settled transcript.
+    # Guard: a store chain moved to a new generation, or client-owned/multi-item prefix rows,
+    # never lands those rows in the transcript — the snapshot is the only context carrier.
+    # The durable per-session key preserves that behaviour. Set it from ADMISSION provenance
+    # only: session-chat/wake/runs histories already come from the transcript, and marking them
+    # would poison a normal session permanently.
+    if isinstance(history, list) and data and data.get('history_from_store'):
+        carrier_key = 'api.chain_store_carrier.' + ref.session_id
+        if authority.db.get_meta(carrier_key) or not authority.db.get_messages(ref.session_id, limit=1):
+            authority.db.set_meta(carrier_key, '1')
+            logging.getLogger(__name__).info(
+                'api history: keep store snapshot (carrier) session=%s', ref.session_id)
+        else:
+            history = None
+            logging.getLogger(__name__).info(
+                'api history: drop store snapshot, read transcript session=%s', ref.session_id)
+    if data and history is not None and data.get('history_not_transcript'):
+        authority.db.set_meta('api.chain_store_carrier.' + ref.session_id, '1')
+    return {'adapter': adapter, 'settings': settings, 'history': history,
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered'))}

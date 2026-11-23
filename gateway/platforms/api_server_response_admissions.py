@@ -183,12 +183,14 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
         if error is not None:
             return None, error
     stored_session_id = chain_root = None
+    history_from_store = False
     instructions = body.get('instructions')
     if not history and previous:
         stored = await response_store.off_loop(response_store.get, previous)
         if stored is None:
             return None, _error_response(f'Previous response not found: {previous}', 404)
         history = list(stored.get('conversation_history', []))
+        history_from_store = True
         chain_root = await asyncio.to_thread(_stored_owner, adapter, stored.get('session_id'))
         from gateway.platforms.api_server_authority_runs import continued_session
         stored_session_id, error = await continued_session(adapter, chain_root, request_id)
@@ -216,6 +218,22 @@ async def prepare_context(adapter, request, body, gateway_session_key, durable_k
         ephemeral_system_prompt=instructions, session_id=session_id,
         gateway_session_key=gateway_session_key, bind_declared_conversation=declared_selected,
         **overrides, route=route, relay_metadata=_request_relay_metadata(body))
+    if history_from_store and len(messages) <= 1:
+        # issue #114: this is the snapshot frozen at admission time; the execution side drops it
+        # and reads the settled transcript. Non-durable requests queue too under session
+        # authority, so mark them as well; legacy immediate execution ignores the flag.
+        # Multi-item input's messages[:-1] prefix rows never land in the transcript, so only a
+        # single-item input can be safely replaced by a transcript read.
+        run_kwargs['history_from_store'] = True
+    if history and not history_from_store:
+        # issue #114: client-owned history and multi-item prefix rows are not a complete
+        # transcript. Mark the session as store-carried so a later store turn keeps its snapshot.
+        # Only admission can tell this provenance apart: session-chat/wake/runs histories come
+        # from the transcript and must never set this key.
+        run_kwargs['history_not_transcript'] = True
+    elif history_from_store and len(messages) > 1:
+        # Multi-item store turns keep the snapshot (prefix rows), but are still store-carried.
+        run_kwargs['history_not_transcript'] = True
     if stored_session_id and stored_session_id != chain_root:
         run_kwargs['walked_from'] = chain_root  # the chain moved past its swept stored session
     if durable_key:
