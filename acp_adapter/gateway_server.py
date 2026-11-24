@@ -596,9 +596,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
 
     async def _confirm_deferred_pick(self, session_id, editor_id, ask):
         """The owner's boundary ask for a guarded deferred pick (``confirmation_required``; nothing
-        written, the pick stays pending): the same permission request as an idle pick. Yes re-sends
-        the same selection once with the owner's token (as Ink/Desktop); no, or no editor, keeps the
-        committed model, and the editor is told which outcome it got, never left on the promise."""
+        written, the pick stays pending): auto-accept it as an idle pick does, surfacing the guard's
+        reason as a neutral FYI, then re-send the same selection once with the owner's token. A
+        second refusal or a stale token is reported as `Model not switched` — never left on the
+        promise. With no editor, decline and keep the committed model. `create_task` is used only to
+        keep this off the event pump; there is no longer a human answer to wait for."""
         from acp_adapter.gateway_commands import _model_text, deferred_pick_text, refused_pick_text
         from hermes_cli.gateway_mutations import model_refusal_text
 
@@ -633,29 +635,31 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             await say(refused_pick_text({**committed, "reason": str(exc)}))
 
     def _model_confirmer(self, session_id):
-        """The owner's guarded-model confirmation as an ACP permission request (the mechanism
-        approvals use): "Switch anyway" re-sends the mutation once with the owner's token; deny,
-        dismissal or a lost editor keeps the current model. None without an editor connection."""
+        """Acknowledge the owner's guarded-model warning in place of an approval card.
+
+        The operator already chose the model in the picker; a second "switch anyway?" permission
+        request is the card they complained about. The guard's job is to inform, not to re-ask:
+        auto-accept it and surface the guard's reason plus a neutral prefix as a plain FYI. The wording
+        stays neutral about the outcome — the mutation is re-sent with the token AFTER this returns, and can still
+        fail (stale token, busy session, a second refusal). Claiming "switching now" here would
+        contradict the authoritative "not switched" message on that path. Without an editor
+        connection (non-interactive surface) there is nobody to inform, so we decline rather than
+        silently switch a guarded model.
+        """
         if self._conn is None:
             return None
 
         async def confirm(refusal):
-            from acp.schema import AllowedOutcome, PermissionOption
-            from agent.i18n import t
-            from hermes_cli.gateway_mutations import confirmation_title
-            title = confirmation_title(refusal)
-            tool_call = acp.update_tool_call(
-                f"model-confirm-{uuid.uuid4().hex[:12]}", title=f"{title}: {refusal.get('target_model', '')}",
-                kind="other", status="pending",
-                content=[acp.tool_content(acp.text_block(refusal['confirm_message']))],
-                raw_input={'model': refusal.get('target_model'), 'provider': refusal.get('target_provider'),
-                           'guards': [w.get('kind') for w in refusal.get('warnings') or []]})
-            options = [PermissionOption(option_id="allow_once", kind="allow_once",
-                                        name=t("cli.model.choice_switch_anyway")),
-                       PermissionOption(option_id="deny", kind="reject_once", name=t("cli.model.choice_cancel"))]
-            response = await self._conn.request_permission(session_id=self._editor_id(session_id),
-                                                           tool_call=tool_call, options=options)
-            return isinstance(response.outcome, AllowedOutcome) and response.outcome.option_id == "allow_once"
+            # Neutral FYI: the guard reason, never a claim about the outcome — the mutation is
+            # re-sent with the token AFTER this returns and can still fail. The authoritative
+            # success/failure message is reported separately by the caller.
+            reason = refusal.get('confirm_message') or ''
+            text = f"Model guard: noted.\n{reason}".rstrip()
+            await self._conn.session_update(
+                session_id=self._editor_id(session_id),
+                update=acp.update_agent_message_text(text + "\n"),
+            )
+            return True
         return confirm
 
     def _held_session(self, session_id):
@@ -1194,8 +1198,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             return
         if (kind == "session.updated" and payload.get("operation") == "model"
                 and payload.get("status") == "confirmation_required" and isinstance(payload.get("confirm"), str)):
-            # A deferred pick whose target needs consent at the turn boundary: asked like an idle
-            # pick (off the event pump: the answer may take as long as the user does).
+            # A deferred pick whose target is guarded: auto-accepted as an idle pick, off the
+            # event pump (create_task only avoids blocking it — there is no human answer to wait for).
             task = asyncio.create_task(self._confirm_deferred_pick(sid, editor_id, payload))
             self._background.add(task)
             task.add_done_callback(self._background.discard)
