@@ -134,10 +134,11 @@ def _measured(model_peer):
 @pytest.mark.platforms('linux')
 @pytest.mark.asyncio
 @pytest.mark.parametrize('daemon', [_GUARDED], indirect=True)
-async def test_guarded_deferred_pick_asks_the_editor_at_the_boundary_and_lands_on_yes(daemon, tmp_path, model_peer):
-    """Any measured context trips the large-context guard: at the turn boundary the owner asks
-    (``confirmation_required``) instead of applying. ACP asks through its permission request and the
-    yes commits the pick; it never stays silently pending (#140190 review)."""
+async def test_guarded_deferred_pick_switches_at_the_boundary_without_an_approval_card(daemon, tmp_path, model_peer):
+    """Any measured context trips the large-context guard: at the turn boundary the owner reports
+    it (``confirmation_required``) but the ACP surface auto-accepts and commits the pick — the
+    picker action was already the operator's consent, so no second approval card is raised. The pick
+    still lands at the boundary and is reported; it never stays silently pending (#140190 review)."""
     _second_on_peer(daemon, model_peer)
     _measured(model_peer)
     async with viewer(daemon) as ws:
@@ -150,17 +151,12 @@ async def test_guarded_deferred_pick_asks_the_editor_at_the_boundary_and_lands_o
             running, start = await _pick_during_a_turn(acp, sid, model_peer)
             model_peer.release.set()
             assert (await running)['result']['stopReason'] == 'end_turn'
-            await async_wait_until(lambda: any(f.get('method') == 'session/request_permission'
-                                               for f in acp.frames[start:]), timeout=20,
-                                   what='the guarded deferred pick asked through ACP')
-            ask = next(f for f in acp.frames[start:] if f.get('method') == 'session/request_permission')
-            assert 'second-model' in json.dumps(ask['params']), ask
-            assert model_peer.requests[-1]['model'] == 'local-wire-stub'  # nothing applied without consent
-            acp.process.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': ask['id'], 'result': {
-                'outcome': {'outcome': 'selected', 'optionId': 'allow_once'}}}).encode() + b'\n')
-            await acp.process.stdin.drain()
+            # No approval card: the picker action is consent. The guard is reported as an FYI and
+            # the pick commits at the boundary without anyone answering a permission request.
             await async_wait_until(lambda: 'Model switched to: second-model' in _shown(acp.frames, start),
-                                   timeout=15, what='the confirmed pick reported')
+                                   timeout=15, what='the guarded pick landed and was reported')
+            perms = [f for f in acp.frames[start:] if f.get('method') == 'session/request_permission']
+            assert not perms, f"model switch must not raise an approval card: {perms}"
             after = await acp.rpc('session/prompt', sessionId=sid, prompt=[{'type': 'text', 'text': 'WS_SHARED after'}])
             assert after['result']['stopReason'] == 'end_turn', after
             assert model_peer.requests[-1]['model'] == 'second-model', model_peer.requests[-1]
