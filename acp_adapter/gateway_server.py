@@ -159,7 +159,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         from acp_adapter.auth import build_auth_methods
         return InitializeResponse(protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=__version__),
-            agent_capabilities=AgentCapabilities(load_session=True,
+            agent_capabilities=AgentCapabilities(field_meta={"hermesStudio": {"surfaceV1": True}}, load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(fork=SessionForkCapabilities(), list=SessionListCapabilities(),
                                                          resume=SessionResumeCapabilities())),
@@ -804,6 +804,12 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         submit = {'text': text}
         if attachments:
             submit['attachments'] = attachments
+        # ACP `session/prompt` `_meta.hermesStudio` carries the per-turn surface (Studio dispatch /
+        # completion / live call). It is a model-bound note, never a replacement for `text`.
+        from gateway.session_surface import submit_surface_fields
+        surface_meta = kwargs.get('hermesStudio')
+        if isinstance(surface_meta, dict):
+            submit.update(submit_surface_fields(surface_meta))
         self._submitting.add(session_id)
         try:
             # Inside the try: a failed reconnect is as ambiguous for a retained identity as a lost ack.

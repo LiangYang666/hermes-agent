@@ -540,6 +540,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=get_version_info().base_version),
             agent_capabilities=AgentCapabilities(
+                field_meta={"hermesStudio": {"surfaceV1": True}},
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
@@ -731,14 +732,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return user_text, user_content
 
     def _claim_turn_or_queue(
-        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool,
+        display_text: str | None = None,
     ) -> str | None:
         """Mark the session running; if a turn is active, redirect it (text-only, supported
         runtime) or queue it. Returns the client message when absorbed, else None."""
         with state.runtime_lock:
+            shown = display_text if display_text is not None else (user_text or "[Image attachment]")
             if not state.is_running and not state.command_op:
                 state.is_running = True
-                state.current_prompt_text = user_text or "[Image attachment]"
+                state.current_prompt_text = shown
                 return None
             # Redirect steers a live turn; a state-mutating command (command_op) has none.
             if state.is_running and text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
@@ -749,12 +752,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         return "Redirected the active turn with your correction."
                 except Exception:
                     logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            state.queued_prompts.append(user_text or "[Image attachment]")
+            state.queued_prompts.append(shown)
             return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
     def _run_agent_turn(
         self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
         loop: asyncio.AbstractEventLoop, approval_cb: Any, edit_approval_requester: Any,
+        persist_text: str,
     ) -> dict:
         """Executor-thread body of one turn, run inside ``contextvars.copy_context()`` so
         ContextVar writes are isolated from concurrent sessions.
@@ -810,7 +814,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             try:
                 return agent.run_conversation(
                     user_message=user_content, conversation_history=state.history, task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
+                    persist_user_message=persist_text,
                 )
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
@@ -826,10 +830,30 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
-        if not user_text and not (isinstance(user_content, list) and user_content):
+        # ACP `_meta.hermesStudio` surface fields reach the model as a note on the user message,
+        # never as words attributed to the user. Gateway sessions do this inside prompt.submit;
+        # this direct ACP path must do the same before the turn is claimed. A completion wake has an
+        # EMPTY text and lives entirely in this note, so the empty-text guard must see it.
+        from gateway.session_surface import admit_surface, submit_surface_fields, surface_note
+        surface_meta = kwargs.get('hermesStudio')
+        surface_v1 = admit_surface(submit_surface_fields(surface_meta)).get('surface_v1', {}) if isinstance(surface_meta, dict) else {}
+        state.agent._gateway_turn_system_delivery = surface_v1.get('surface') == 'studio-completion'
+        surface_notes = surface_note(surface_v1)
+        if not user_text and not (isinstance(user_content, list) and user_content) and not surface_notes:
             return PromptResponse(stop_reason="end_turn")
 
         user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
+        if surface_notes:
+            from agent.turn_context import append_notes_to_multimodal_content, compose_user_api_content
+            if not append_notes_to_multimodal_content(user_content, surface_notes):
+                composed = compose_user_api_content(user_content, '', surface_notes)
+                if composed is not None:
+                    user_content = composed
+
+        # A completion wake has no operator words: its whole notice is a surface note. Never
+        # manufacture an "[Image attachment]" user row for it — that row is what review A/B
+        # caught on this direct-ACP path (the gateway path already persisted an empty row).
+        persist_text = user_text or ("" if surface_notes else "[Image attachment]")
 
         # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
@@ -844,7 +868,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 await self._drain_queued_prompts(state, session_id, self._conn)
                 return PromptResponse(stop_reason="end_turn")
 
-        absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
+        absorbed = self._claim_turn_or_queue(
+            state, session_id, user_text, user_content, text_only_prompt, display_text=persist_text,
+        )
         if absorbed is not None:
             if self._conn:
                 await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
@@ -861,6 +887,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 return self._run_agent_turn(
                     state=state, session_id=session_id, user_text=user_text, user_content=user_content, conn=conn,
                     loop=loop, approval_cb=cbs.approval_cb, edit_approval_requester=cbs.edit_approval_requester,
+                    persist_text=persist_text,
                 )
             finally:
                 # Still on the executor thread: ``_send_update`` blocks on the loop, so flushing

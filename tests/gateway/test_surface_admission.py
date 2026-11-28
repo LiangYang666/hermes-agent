@@ -72,6 +72,62 @@ async def test_surface_fields_are_admitted_and_scoped_to_their_own_turn(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_studio_delivery_surfaces_keep_the_transcript_clean(tmp_path, monkeypatch):
+    """Dispatch notices and completion wakes ride surface_v1: provenance is a model-bound note,
+    the durable row stays the task text (or empty for a completion), and a completion is flagged
+    as a system delivery so title / memory can skip it."""
+    from gateway.session_controls import AuthorityConnection
+    from gateway.session_surface import surface_turn_note, surface_system_delivery
+    from hermes_state_runtime import list_session_admissions
+
+    seen = []
+
+    async def answer(event):
+        seen.append((event.text, surface_turn_note(SimpleNamespace(valid_tool_names=set())),
+                     surface_system_delivery()))
+        return 'ok'
+
+    authority = await _authority(tmp_path, monkeypatch, answer)
+    connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
+    try:
+        await connection.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': 's'}})
+        dispatch = await connection.dispatch({'id': 2, 'method': 'prompt.submit', 'params': {
+            'session_id': 's', 'submission_id': 'dispatch', 'text': 'ship the patch',
+            'surface': 'studio-dispatch',
+            'studio_context': json.dumps({'kind': 'dispatch', 'sourceSessionId': 'abc123',
+                                          'sourceTitle': 'planner', 'dispatcher': 'abc123'})}})
+        assert 'result' in dispatch, dispatch
+        assert dispatch['result']['status'] == 'queued', dispatch
+        await authority.sessions['s'].task
+        completion = await connection.dispatch({'id': 3, 'method': 'prompt.submit', 'params': {
+            'session_id': 's', 'submission_id': 'completion', 'text': '',
+            'surface': 'studio-completion',
+            'studio_context': json.dumps({'kind': 'completion', 'sourceSessionId': 'worker1',
+                                          'text': 'worker1 finished'})}})
+        assert completion['result']['status'] == 'queued', completion
+        await authority.sessions['s'].task
+        rejected = await connection.dispatch({'id': 4, 'method': 'prompt.submit', 'params': {
+            'session_id': 's', 'submission_id': 'smuggled', 'text': 'x',
+            'surface': 'hud', 'studio_context': '{"text":"not allowed"}'}})
+        assert rejected['error']['message'] == 'invalid_params', rejected
+    finally:
+        await connection.close()
+
+    rows = {row['request_id']: row for row in list_session_admissions(authority.db, session_id='s', pending_only=False)}
+    assert rows['dispatch']['payload']['surface_v1']['surface'] == 'studio-dispatch'
+    assert rows['completion']['payload']['surface_v1']['surface'] == 'studio-completion'
+    assert 'smuggled' not in rows
+
+    (dispatch_text, dispatch_note, dispatch_system), (completion_text, completion_note, completion_system) = seen
+    assert dispatch_text == 'ship the patch', 'only the task itself is the user row'
+    assert 'source session: abc123' in dispatch_note and 'planner' in dispatch_note
+    assert dispatch_system is False
+    assert completion_text == '', 'the completion notice never becomes a user row'
+    assert 'worker1 finished' in completion_note and 'SYSTEM DELIVERY' in completion_note
+    assert completion_system is True
+
+
+@pytest.mark.asyncio
 async def test_voice_turn_is_admitted_and_scoped_to_its_own_turn(tmp_path, monkeypatch):
     """A spoken voice-mode turn (TUI/Desktop ``voice_turn``) rides canonical admission to the turn
     that runs on ``auxiliary.voice_chat``; the next typed turn stays on the main model."""

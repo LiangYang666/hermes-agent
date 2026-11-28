@@ -17,10 +17,12 @@ from .registry import method
 
 
 class ClientSurface(WireEnum):
-    """Where the user typed this turn; anything else is treated as the plain app window."""
+    """Where this turn came from; anything else is treated as the plain app window."""
 
     hud = "hud"
     voice_live = "voice-live"
+    studio_dispatch = "studio-dispatch"
+    studio_completion = "studio-completion"
 
 
 class PromptSubmitParams(SessionParams):
@@ -35,6 +37,7 @@ class PromptSubmitParams(SessionParams):
     queued: bool | None = None  # client queue drain — the busy path must hold it, never redirect/steer
     surface: str | None = None  # a ClientSurface value; unknown values clear the surface
     voice_context: str | None = None  # recent spoken transcript, model input only (voice-live)
+    studio_context: str | None = None  # Studio dispatch / completion / call state; model-bound note only
     voice_turn: bool | None = None  # a spoken voice-conversation turn: runs on auxiliary.voice_chat
     # Desktop-generated large-paste preview (first ~1000 chars); TITLE input only, never the model turn.
     title_preview: str | None = None

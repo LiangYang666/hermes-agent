@@ -70,14 +70,23 @@ def _safe_session_filename_component(session_id: str) -> str:
     return f"{sanitized}_{hashlib.sha256(raw.encode('utf-8', errors='surrogatepass')).hexdigest()[:12]}"
 
 
+def _is_plain_text_content(content: Any) -> bool:
+    """A list content made only of OpenAI text parts carries no native media to preserve."""
+    return isinstance(content, list) and all(
+        isinstance(part, dict) and part.get('type') == 'text' for part in content
+    )
+
+
 def _override_replaces_content(msg: dict, content: Any, override: Any) -> bool:
     """May the persist override replace ``content``? A plain-text override must not replace native image/audio
-    blocks (a list override is the clean multimodal payload and does), nor a message MERGED with a compaction
-    summary (overwriting would drop the summary)."""
+    blocks (a list override is the clean multimodal payload and does); nor a message MERGED with a compaction
+    summary (overwriting would drop the summary). A plain-text LIST is text, not native media: when the
+    runtime keeps a clean string override (e.g. ACP surface notes on the api_content sidecar), that
+    string is the durable row and must win."""
     return (
         override is not None
         and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
-        and (not isinstance(content, list) or isinstance(override, list))
+        and (not isinstance(content, list) or isinstance(override, list) or _is_plain_text_content(content))
     )
 
 

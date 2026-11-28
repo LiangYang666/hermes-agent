@@ -8848,6 +8848,11 @@
             ],
             "default": null,
             "title": "Client Env"
+          },
+          "observer": {
+            "default": false,
+            "title": "Observer",
+            "type": "boolean"
           }
         },
         "title": "CanonicalCreateParams",
@@ -11319,6 +11324,18 @@
             ],
             "default": null,
             "title": "Voice Context"
+          },
+          "studio_context": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Studio Context"
           },
           "interrupted": {
             "default": false,
@@ -32930,6 +32947,18 @@
             ],
             "default": null,
             "title": "Voice Context"
+          },
+          "studio_context": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Studio Context"
           },
           "voice_turn": {
             "anyOf": [

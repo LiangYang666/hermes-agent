@@ -202,6 +202,10 @@ def _maybe_title_session_at_turn_start(
     agent: Any, messages: list[Any], title_user_message: Optional[str] = None,
 ) -> None:
     """Kick off auto-titling for the session's first user message; never fatal."""
+    # A Studio system delivery (completion wake) has no user words: its notice rides a surface
+    # note, and must never become a session title.
+    if getattr(agent, "_gateway_turn_system_delivery", False):
+        return
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not session_db or not session_id:
@@ -969,6 +973,8 @@ def _memory_turn_start_and_prefetch(
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
     Returns the prefetch text (``""`` when nothing was injected)."""
+    if getattr(agent, "_gateway_turn_system_delivery", False):
+        return ""
     if not agent._memory_manager:
         return ""
     _query = _memory_query_text(original_user_message)

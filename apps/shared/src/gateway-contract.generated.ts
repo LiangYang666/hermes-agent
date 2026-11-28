@@ -2823,6 +2823,7 @@ export interface PromptSubmitParams {
   queued?: boolean | null
   surface?: string | null
   voice_context?: string | null
+  studio_context?: string | null
   voice_turn?: boolean | null
   title_preview?: string | null
   truncate_before_user_ordinal?: number | null
@@ -5080,6 +5081,7 @@ export interface CanonicalCreateParams {
   run_budget?: number | null
   verbose?: boolean
   client_env?: Record<string, string> | null
+  observer?: boolean
 }
 export interface CanonicalSnapshot {
   session_id: string
@@ -5276,6 +5278,7 @@ export interface CanonicalSubmitParams {
   unattended?: boolean
   surface?: string | null
   voice_context?: string | null
+  studio_context?: string | null
   interrupted?: boolean
   voice_turn?: boolean
   display_kind?: 'hidden' | null

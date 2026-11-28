@@ -1,6 +1,7 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -83,6 +84,8 @@ class TestInitialize:
         resp = await agent.initialize(protocol_version=1)
         assert isinstance(resp, InitializeResponse)
         assert resp.protocol_version == acp.PROTOCOL_VERSION
+        caps = resp.model_dump(by_alias=True, exclude_none=True)["agentCapabilities"]
+        assert caps["_meta"]["hermesStudio"]["surfaceV1"] is True
 
 
 
@@ -509,6 +512,34 @@ class TestPrompt:
 # Slash commands
 # ---------------------------------------------------------------------------
 
+
+    @pytest.mark.asyncio
+    async def test_completion_surface_persists_empty_row_not_image_placeholder(self, agent, mock_manager):
+        """issue #120: a completion wake has only a surface note; never persist a fake image row."""
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        captured: dict[str, object] = {}
+
+        def _run(*args, **kwargs):
+            captured["persist"] = kwargs.get("persist_user_message")
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="")],
+            session_id=resp.session_id,
+            hermesStudio={
+                "surface": "studio-completion",
+                "studio_context": json.dumps({"kind": "completion", "sourceSessionId": "worker1", "text": "done"}),
+            },
+        )
+        assert captured["persist"] == ""
 
 class TestSlashCommands:
     """Test slash command dispatch in the ACP adapter."""
